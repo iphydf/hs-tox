@@ -1,1 +1,18 @@
+# Build products.
+/dist
 /dist-newstyle
+/*.tix
+
+/.stack-work
+/stack.yaml.lock
+
+# Temporary files.
+*~
+*.swp
+
+# The echo bot's profile.
+/tools/echobot.tox
+/tools/echobot.files
+
+# What libvpx writes when built with its internal stats, as each encoder closes.
+opsnr.stt

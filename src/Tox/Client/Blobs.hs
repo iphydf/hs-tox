@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StrictData          #-}
 -- | Account sync blobs to and from a linked account's home: files of their
 -- own kind whose ID is the SHA-256. Stored on disk by ID in hex. We only
 -- take ones we asked for, and only if the hash matches.

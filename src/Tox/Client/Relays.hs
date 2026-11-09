@@ -25,7 +25,7 @@ relayed names text = do
         _  -> Text.splitAt (maximum (map Text.length known)) rest
   if Text.null name || Text.null said then Nothing else Just (name, Text.drop 2 said)
 
--- | With the last time each was relayed, latest first.
+-- | The names relayed, with the last time each was, latest first.
 relayedNames :: [Text] -> [(UTCTime, Text)] -> [(Text, UTCTime)]
 relayedNames names said =
   sortOn (Down . snd) (Map.toList (Map.fromListWith max [(name, time) | (time, text) <- said, Just (name, _) <- [relayed names text]]))

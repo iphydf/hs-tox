@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData        #-}
 -- | What a Tox client keeps: contacts and their messages, groups, invites,
 -- calls, the profile and settings.
 module Tox.Client.Types
@@ -37,11 +38,16 @@ module Tox.Client.Types
   , memberActions
   , GroupEntry (..)
   , entryInUse
+  , entryText
   , Happening (..)
+  , GroupFile (..)
+  , groupFileName
   , Invite (..)
   , Founding (..)
   , groupMuted
   , mentions
+  , memberLabel
+  , noticeText
   , groupNick
   , Profile (..)
   , ProfileId (..)
@@ -56,6 +62,8 @@ module Tox.Client.Types
   , glareWait
   , meeting
   , ringTimeout
+  , typingPause
+  , shownText
   ) where
 
 import qualified Crypto.Hash.SHA256     as SHA256
@@ -68,13 +76,14 @@ import           Data.Int               (Int64)
 import           Data.Map.Strict        (Map)
 import qualified Data.Map.Strict        as Map
 import           Data.Maybe             (fromMaybe, isNothing)
-import           Data.Set               (Set)
 import           Data.Text              (Text)
 import qualified Data.Text              as Text
 import qualified Data.Text.Encoding     as Text
 import           Data.Time              (NominalDiffTime, UTCTime)
 import           Data.Word              (Word32, Word64, Word8)
 import qualified Tox.Application.Tox    as Tox
+import qualified Tox.Share.Info         as Info
+import           Tox.Share.Info         (Info)
 
 -- | Friend's public key in upper case hex.
 newtype ContactId = ContactId Text
@@ -148,7 +157,7 @@ data Message = Message
     -- ^ When the friend got all of ours, if we know.
   , messageKind      :: Tox.MessageType
   , messageRaw       :: Maybe BS.ByteString
-    -- ^ Their bytes as Tox carried them (the text is read from these).
+    -- ^ Their bytes as Tox carried them, which the text may not show all of.
     -- Nothing for messages from before we kept them.
   , messageId        :: MessageId
   } deriving (Eq, Show)
@@ -210,8 +219,8 @@ data Staged
 data AccountSettings = AccountSettings
   { settingAutoAccept :: Word64
     -- ^ Accept their files up to this size without asking (0 = never).
-  , settingFormatsOff :: Set Text
-    -- ^ Formats not to read (those messages show as Tox carried them).
+  , settingTyping     :: Bool
+    -- ^ Tell friends when we're typing, and show when they are.
   } deriving (Eq, Show)
 
 -- | Settings of this device only. Changes apply when Tox restarts.
@@ -298,6 +307,8 @@ data Group = Group
   , groupMute     :: Maybe Mute
   , groupMentions :: Bool
     -- ^ Notify about messages naming us while muted (on by default).
+  , groupPictures :: Maybe Text
+    -- ^ Picture format we send in, if not as they are.
   , groupTopic    :: Text
   , groupMayTopic :: Bool
     -- ^ Whether Tox would take a topic from us. Not saved.
@@ -321,7 +332,7 @@ data Group = Group
 newGroup :: Text -> GroupKind -> GroupPhase -> Group
 newGroup name kind phase = Group
   { groupName = name, groupKind = kind, groupPhase = phase, groupEntries = [], groupUnread = 0
-  , groupMembers = Map.empty, groupSaved = Nothing, groupMute = Nothing, groupMentions = True, groupTopic = ""
+  , groupMembers = Map.empty, groupSaved = Nothing, groupMute = Nothing, groupMentions = True, groupPictures = Nothing, groupTopic = ""
   , groupMayTopic = False, groupSince = Nothing, groupRoles = Map.empty, groupStatuses = Map.empty, groupSelfRole = Nothing
   , groupSettings = Nothing, groupRelayBot = Nothing, groupEarlier = False }
 
@@ -348,14 +359,23 @@ data GroupEntry = GroupEntry
 -- | Ours until it went (we send it again once in the group).
 entryInUse :: GroupEntry -> Bool
 entryInUse e = case entryWhat e of
-  Said Nothing _ _ Pending -> True
-  PrivateTo _ _ _ Pending  -> True
-  _                        -> False
+  Said Nothing _ _ Pending _ -> True
+  PrivateTo _ _ _ Pending    -> True
+  _                          -> False
+
+-- | What a message in the group says, to reply to, copy or forward.
+entryText :: GroupEntry -> Maybe Text
+entryText e = case entryWhat e of
+  Said _ _ body _ _    -> Just (shownText body)
+  PrivateFrom _ _ body -> Just (shownText body)
+  PrivateTo _ _ body _ -> Just (shownText body)
+  _                    -> Nothing
 
 data Happening
-  = Said (Maybe Member) Tox.MessageType Text Delivery
+  = Said (Maybe Member) Tox.MessageType Text Delivery (Maybe Word32)
     -- ^ Nothing for ours. Ours only go 'Pending' to 'Sent' (groups confirm
-    -- nothing).
+    -- nothing). Then the Tox message ID, once Tox gave one, which history
+    -- sync matches by.
   | PrivateFrom Member Tox.MessageType Text
   | PrivateTo Member Tox.MessageType Text Delivery
   | Moderated (Maybe Member) (Maybe Member) Tox.Moderation
@@ -366,7 +386,48 @@ data Happening
     -- ^ Nothing for ours.
   | Noted Text
     -- ^ From a linked account's home.
+  | SharedFile (Maybe Member) GroupFile (Maybe Word32)
+    -- ^ A file shared in the group (Nothing for ours), and the Tox message
+    -- ID of its announcement.
   deriving (Eq, Show)
+
+-- | Their name, or the start of their key.
+memberLabel :: Member -> Text
+memberLabel m
+  | not (Text.null (memberName m)) = memberName m
+  | not (Text.null (memberKey m)) = Text.take 8 (memberKey m)
+  | otherwise = "Someone"
+
+-- | A line saying what happened in a group, if it isn't a message or file:
+-- joins, leaves, topics and moderation.
+noticeText :: Happening -> Maybe Text
+noticeText = \case
+  Arrived who -> Just (memberLabel who <> " joined")
+  Departed who -> Just (memberLabel who <> " left")
+  TopicSet who topic -> Just (maybe "You" memberLabel who <> " set the topic: " <> topic)
+  Noted t -> Just t
+  Moderated by whom m -> Just $ maybe "You" memberLabel by <> case m of
+    Tox.ModKick      -> " removed " <> target
+    Tox.ModModerator -> " made " <> target <> " a moderator"
+    Tox.ModUser      -> " made " <> target <> " a member who can speak"
+    Tox.ModObserver  -> " made " <> target <> " an observer"
+    where target = maybe "you" memberLabel whom
+  _ -> Nothing
+
+-- | A file shared in a group. We only download it when asked to.
+data GroupFile = GroupFile
+  { groupFileId   :: BS.ByteString
+    -- ^ The SHA1 of its info.
+  , groupFileInfo :: Maybe Info
+    -- ^ Once it came. We keep it to download the file after a restart.
+  , groupFileData :: Maybe Attachment
+    -- ^ Once its info came. 'Waiting' until we download it.
+  , groupFileRate :: Double
+    -- ^ Bytes a second it comes at, while it does.
+  } deriving (Eq, Show)
+
+groupFileName :: GroupFile -> Maybe Text
+groupFileName = fmap (Text.decodeUtf8Lenient . Info.name) . groupFileInfo
 
 data Invite = Invite
   { inviteKind     :: GroupKind
@@ -445,6 +506,8 @@ data Call = Call
     -- during the call.
   , callVia       :: Maybe ContactId
     -- ^ Linked account's home, which relays the audio and video.
+  , callDevice    :: Maybe ContactId
+    -- ^ The account's device that took it, which we relay it to.
   } deriving (Eq, Show)
 
 callTarget :: Call -> ContactId
@@ -452,7 +515,7 @@ callTarget c = fromMaybe (callContact c) (callVia c)
 
 newCall :: ContactId -> CallPhase -> UTCTime -> Bool -> Call
 newCall cid phase time video =
-  Call cid phase time (phase == Calling) video False False False Clear Nothing Nothing
+  Call cid phase time (phase == Calling) video False False False Clear Nothing Nothing Nothing
 
 data CallPhase
   = Calling
@@ -482,3 +545,12 @@ meeting = 15
 
 ringTimeout :: NominalDiffTime
 ringTimeout = 60
+
+-- | What shows of a message's text: up to its first zero byte. What follows
+-- stays in the message, as some clients put extras there, or hide things.
+shownText :: Text -> Text
+shownText = Text.takeWhile (/= '\0')
+
+-- | How long after the user last typed a friend hears they stopped.
+typingPause :: NominalDiffTime
+typingPause = 3

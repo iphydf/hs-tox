@@ -1,3 +1,4 @@
+{-# LANGUAGE StrictData #-}
 -- | Identicons as other Tox clients draw them, so a contact looks the same
 -- everywhere: blocks of 2 colours from the key's SHA-256, mirrored.
 module Tox.Client.Identicon
@@ -65,7 +66,7 @@ hsl hue saturation lightness = (channel r, channel g, channel b)
     channel :: Double -> Word8
     channel c = floor ((c + match) * 255 + 0.5)
 
--- | Square PNG of @size@ pixels, rounded down to whole blocks.
+-- | A square PNG of @size@ pixels, rounded down to whole blocks.
 identiconPng :: Int -> Identicon -> BS.ByteString
 identiconPng size (Identicon (one, two) blocks) =
   png side side $ \x y ->

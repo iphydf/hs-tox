@@ -1,13 +1,19 @@
-load("@rules_haskell//haskell:defs.bzl", "haskell_library", "haskell_test")
+load("@rules_haskell//haskell:defs.bzl", "haskell_library")
+load("//third_party/haskell/hspec-discover:build_defs.bzl", "hspec_test")
+load("//tools/project:build_defs.bzl", "project")
+
+project(license = "gpl3-https")
 
 haskell_library(
-    name = "tox",
+    name = "hs-tox",
     srcs = glob(["src/**/*.hs"]),
+    ghcopts = ["-j4"],
     src_strip_prefix = "src",
     tags = [
         "haskell",
         "no-cross",
     ],
+    version = "0.0.1",
     visibility = ["//visibility:public"],
     deps = [
         "//hs-toxav",
@@ -15,7 +21,7 @@ haskell_library(
         "//hs-toxcore:tox-core",
         "//hs-toxcore:tox-crypto",
         "//hs-toxcore:tox-session",
-        "//hs-toxsync:toxsync",
+        "//hs-toxsync",
         "//third_party/haskell:base",
         "//third_party/haskell:base16-bytestring",
         "//third_party/haskell:binary",
@@ -24,29 +30,27 @@ haskell_library(
         "//third_party/haskell:cryptohash-sha256",
         "//third_party/haskell:directory",
         "//third_party/haskell:filepath",
-        "//third_party/haskell:monad-logger",
         "//third_party/haskell:qrcode-core",
+        "//third_party/haskell:random",
         "//third_party/haskell:saltine",
         "//third_party/haskell:text",
         "//third_party/haskell:time",
+        "//third_party/haskell:transformers",
         "//third_party/haskell:unix",
         "//third_party/haskell:vector",
     ],
 )
 
-haskell_test(
+hspec_test(
     name = "testsuite",
     size = "small",
-    srcs = glob(["test/**/*.hs"]),
-    main_file = "test/testsuite.hs",
-    src_strip_prefix = "test",
-    tags = ["haskell"],
     deps = [
-        ":tox",
+        ":hs-tox",
+        "//hs-toxav",
         "//hs-toxcore:tox-application",
         "//hs-toxcore:tox-crypto",
         "//hs-toxcore:tox-network",
-        "//hs-toxsync:toxsync",
+        "//hs-toxsync",
         "//third_party/haskell:QuickCheck",
         "//third_party/haskell:base",
         "//third_party/haskell:base16-bytestring",

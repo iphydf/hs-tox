@@ -13,8 +13,7 @@ homepage:      https://toktok.ltd
 category:      Network
 description:
   The parts every Tox client needs: contacts and their chats, groups, calls,
-  file transfers, avatars and linked devices, with the formats and settings
-  around them.
+  file transfers, avatars and linked devices, with the settings around them.
 
 source-repository head
   type:     git
@@ -32,7 +31,7 @@ library
     Tox.Client.Debug
     Tox.Client.Export
     Tox.Client.Files
-    Tox.Client.Formats
+    Tox.Client.Home
     Tox.Client.Identicon
     Tox.Client.Import
     Tox.Client.Linked
@@ -45,9 +44,12 @@ library
     Tox.Client.Png
     Tox.Client.Qoi
     Tox.Client.QrCode
+    Tox.Client.Recording
     Tox.Client.Relays
+    Tox.Client.Synced
     Tox.Client.Types
     Tox.Client.Update
+  other-modules:    Tox.Client.Nodes.BuiltIn
   build-depends:
       base               <5
     , base16-bytestring  >=1      && <1.1
@@ -57,14 +59,15 @@ library
     , cryptohash-sha256  <0.12
     , directory          <1.4
     , filepath           <1.6
-    , monad-logger       <0.4
     , qrcode-core        <0.10
+    , random             >=1.2    && <1.4
     , saltine            >=0.2    && <0.3
     , text               <2.2
     , time               <2
     , toxav              >=0.0.1  && <0.0.2
     , toxcore            >=0.2.12 && <0.3
     , toxsync            >=0.0.1  && <0.0.2
+    , transformers       <0.7
     , unix               <2.9
     , vector             <0.14
 
@@ -74,12 +77,13 @@ test-suite testsuite
   hs-source-dirs:     test
   ghc-options:        -Wall
   main-is:            testsuite.hs
+  build-tool-depends: hspec-discover:hspec-discover
   other-modules:
     Tox.Client.ChangesSpec
     Tox.Client.DebugSpec
     Tox.Client.ExportSpec
     Tox.Client.FilesSpec
-    Tox.Client.FormatsSpec
+    Tox.Client.HomeSpec
     Tox.Client.IdenticonSpec
     Tox.Client.LinkedSpec
     Tox.Client.LocationsSpec
@@ -104,6 +108,7 @@ test-suite testsuite
     , text
     , time
     , tox
+    , toxav
     , toxcore
     , toxsync
     , vector

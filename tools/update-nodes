@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Writes src/Tox/Client/Nodes/BuiltIn.hs from nodes.tox.chat's list, for a
+release to start from. Clients never fetch the list themselves."""
+
+import json
+import pathlib
+import sys
+import urllib.request
+
+URL = "https://nodes.tox.chat/json"
+OUT = pathlib.Path(__file__).parent.parent / "src/Tox/Client/Nodes/BuiltIn.hs"
+
+# What the list says for an address a node doesn't have.
+NO_ADDRESS = {"", "-", "NONE"}
+
+
+def main() -> None:
+    with urllib.request.urlopen(URL, timeout=60) as response:
+        nodes = [
+            node for node in json.load(response)["nodes"]
+            if node["ipv4"] not in NO_ADDRESS
+        ]
+    # The list has no nodes when its scan finds none, and that mustn't
+    # replace the last one.
+    if not any(node["status_tcp"] and node["tcp_ports"] for node in nodes):
+        sys.exit(f"{URL} has no TCP relays now: try again later")
+    entries = "\n  , ".join(
+        f"({json.dumps(node['ipv4'])}, {node['port']}, "
+        f"{json.dumps(node['tcp_ports']).replace(' ', '')}, "
+        f"{json.dumps(node['public_key'])}, {node['status_tcp']})"
+        for node in nodes)
+    OUT.write_text(f"""\
+-- | Written by tools/update-nodes from {URL}.
+-- Run it again before each release.
+module Tox.Client.Nodes.BuiltIn (nodes) where
+
+import           Data.Word (Word16)
+
+-- | Each node's host, port, TCP ports, public key, and whether the list's
+-- last check reached it over TCP.
+nodes :: [(String, Word16, [Word16], String, Bool)]
+nodes =
+  [ {entries}
+  ]
+""")
+
+
+if __name__ == "__main__":
+    main()

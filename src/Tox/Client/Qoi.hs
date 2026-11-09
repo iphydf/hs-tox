@@ -161,7 +161,7 @@ encodeQoi width height pixels
         db = d 2
     hashOf px = fromIntegral ((channel 0 px * 3 + channel 1 px * 5 + channel 2 px * 7 + channel 3 px * 11) `mod` 64)
 
--- | BMP no larger than this on its longer side.
+-- | A BMP no larger than this on its longer side.
 qoiBitmap :: Int -> BS.ByteString -> Either String BS.ByteString
 qoiBitmap longest bytes = do
   (width, height, pixels) <- decodeQoi bytes

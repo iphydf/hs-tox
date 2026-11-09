@@ -37,6 +37,15 @@ spec =
         , "most sent NodesRequest 10 (20 KB)", "requests searching for friends 4" ]
       Text.splitOn "; " (summary Nothing sampleReport) `shouldContain` ["requests searching for friends 7"]
 
+    it "give each call's audio and video, in the rows and the log" $ do
+      mapM_ (\row -> toxRows "profile 7" sampleReport `shouldContain` [row])
+        [ ("profile 7 call 1d16d2ab audio made up", 2), ("profile 7 call 1d16d2ab video lost", 7)
+        , ("profile 7 call 1d16d2ab video smeared frames", 3), ("profile 7 call 1d16d2ab video smeared ms", 66) ]
+      Text.splitOn "; " (summary Nothing sampleReport) `shouldContain`
+        [ "call with 1d16d2ab: audio 3 sped up, 1 slowed down, 2 blocks made up, 0 jumps ahead"
+        , "video 600 frames, 7 lost (5 incomplete), 22 key frames, 2 smears over 3 frames (66 ms), 598 pictures, 0 failed"
+        , "sending video with c2.exynos.h264.encoder, NV12 480x640 in rows of 512, planes of 640" ]
+
     it "keeps the last 30 minutes of samples, in files that expire whole" $ withDir $ \dir -> do
       let at m = addUTCTime (m * 60) (UTCTime (fromGregorian 2026 11 7) 0)
       mapM_ (\m -> recordSample dir (at m) [("heap live", round m)]) [0, 5, 12, 25, 41]

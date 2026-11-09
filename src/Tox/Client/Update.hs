@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData        #-}
 -- | How events change a client, and the commands for Tox.
 module Tox.Client.Update
   ( Event (..)
@@ -10,46 +11,55 @@ module Tox.Client.Update
   , update
   , drafted
   , memberByKey
-  , quoted
+  , replied
   , forwardable
   , interrupted
   ) where
 
-import           Control.Applicative    ((<|>))
-import           Control.Monad          (mfilter)
-import qualified Crypto.Hash.SHA256     as SHA256
-import qualified Data.ByteString        as BS
-import qualified Data.ByteString.Base16 as Base16
-import           Data.List              (find, nub)
-import           Data.Map.Strict        (Map)
-import qualified Data.Map.Strict        as Map
-import           Data.Maybe             (fromMaybe, isJust, isNothing,
-                                         listToMaybe, mapMaybe)
-import qualified Data.Set               as Set
-import           Data.Text              (Text)
-import qualified Data.Text              as Text
-import qualified Data.Text.Encoding     as Text
-import           Data.Time              (UTCTime, diffUTCTime)
-import           Data.Word              (Word64)
-import qualified Tox.Application.Tox    as Tox
-import qualified Tox.Sync.Account       as Sync
-import qualified Tox.Sync.Event         as Sync
-import qualified Tox.Sync.Fact          as Sync
-import qualified Tox.Sync.Id            as Sync
-import qualified Tox.Sync.Protocol      as Protocol
-import qualified Tox.Sync.Replica       as Replica
-import qualified Tox.Sync.Setting       as Sync
-import qualified Tox.Sync.Store         as Sync
+import           Control.Applicative       ((<|>))
+import           Control.Monad             (mfilter)
+import qualified Crypto.Hash.SHA256        as SHA256
+import           Data.Bits                 (shiftR)
+import qualified Data.ByteString           as BS
+import           Data.Containers.ListUtils (nubOrdOn)
+import           Data.List                 (find, insertBy, nub)
+import           Data.Map.Strict           (Map)
+import qualified Data.Map.Strict           as Map
+import           Data.Maybe                (fromMaybe, isJust, isNothing,
+                                            listToMaybe, mapMaybe)
+import           Data.Ord                  (comparing)
+import           Data.Set                  (Set)
+import qualified Data.Set                  as Set
+import           Data.Text                 (Text)
+import qualified Data.Text                 as Text
+import qualified Data.Text.Encoding        as Text
+import           Data.Time                 (UTCTime, diffUTCTime)
+import           Data.Time.Clock.POSIX     (utcTimeToPOSIXSeconds)
+import           Data.Word                 (Word32, Word64)
+import qualified Tox.Application.Tox       as Tox
+import qualified Tox.Share.History         as History
+import qualified Tox.Share.Info            as Info
+import           Tox.Share.Info            (Info)
+import           Tox.Share.Packet          (sha1Info)
+import qualified Tox.Sync.Account          as Sync
+import qualified Tox.Sync.Event            as Sync
+import qualified Tox.Sync.Fact             as Sync
+import qualified Tox.Sync.Id               as Sync
+import qualified Tox.Sync.Protocol         as Protocol
+import qualified Tox.Sync.Replica          as Replica
+import qualified Tox.Sync.Setting          as Sync
+import qualified Tox.Sync.Store            as Sync
 
 import           Tox.Client
-import qualified Tox.Client.Debug       as Debug
-import           Tox.Client.Formats     (Format (..), Reading (..), formats,
-                                         readWith)
-import qualified Tox.Client.Linked      as Linked
-import           Tox.Client.Linked      (Linked)
-import           Tox.Client.Locations   (locationText)
-import           Tox.Client.Messages    (parts)
-import qualified Tox.Client.Pictures    as Pictures
+import qualified Tox.Client.Debug          as Debug
+import qualified Tox.Client.Home           as Home
+import           Tox.Client.Home           (Home)
+import qualified Tox.Client.Linked         as Linked
+import           Tox.Client.Linked         (Linked)
+import           Tox.Client.Locations      (locationText)
+import           Tox.Client.Messages       (parts)
+import qualified Tox.Client.Recording      as Recording
+import           Tox.Client.Synced
 import           Tox.Client.Types
 
 -- | What Tox reports, and what the user wants done.
@@ -61,6 +71,7 @@ data Event
   | FriendNamed ContactId Text
   | FriendStatusMessage ContactId Text
   | FriendStatus ContactId Tox.UserStatus
+  | FriendTyping ContactId Bool
   | FriendAvatar ContactId (Maybe BS.ByteString)
     -- ^ PNG, or Nothing if they removed theirs.
   | Requested ContactId Text
@@ -105,9 +116,30 @@ data Event
   | RolesKnown GroupId (Maybe Tox.Role) [(Tox.PeerId, Tox.Role)]
     -- ^ Ours and the members'.
   | SettingsKnown GroupId Tox.GroupSettings
-  | GroupReceived GroupId UTCTime Tox.PeerId Tox.MessageType Text
+  | GroupReceived GroupId UTCTime Tox.PeerId Tox.MessageType Text (Maybe Word32)
+    -- ^ With its Tox message ID (conferences have none).
   | PrivateReceived GroupId UTCTime Tox.PeerId Tox.MessageType Text
-  | GroupSent GroupId MessageId
+  | GroupSent GroupId MessageId (Maybe Word32)
+    -- ^ With the Tox message ID of its first part (conferences have none).
+  | GroupFileShared GroupId UTCTime Tox.PeerId Word32 BS.ByteString
+    -- ^ A member shared a file: the Tox message ID and the file's ID.
+  | GroupFileLearned GroupId BS.ByteString Info
+    -- ^ Its info: name, size and chunk hashes.
+  | DownloadGroupFile GroupId BS.ByteString
+  | PauseGroupFile GroupId BS.ByteString
+  | GroupFileMoved GroupId BS.ByteString FilePath Word64 Double
+    -- ^ Where it goes, how much of it came, and how fast it comes.
+  | GroupFileEnded GroupId BS.ByteString Bool
+    -- ^ Whether all of it came.
+  | GroupHistoryWanted GroupId Tox.PeerId History.Range
+  | GroupRecalled GroupId UTCTime Tox.PeerId (Map Text Text) [Recalled]
+    -- ^ The messages a member sent for the history we asked it for, with
+    -- the names we know for their senders' keys.
+  | WroteGroupFile GroupId UTCTime FilePath Text Word64
+    -- ^ Our file to share in the group: path, name and size.
+  | GroupFileOffered GroupId MessageId (Maybe (Info, Word32))
+    -- ^ Our file's info and the Tox message ID we announced it with, or
+    -- 'Nothing' if it couldn't be read.
   | GroupSaved GroupId BS.ByteString
   | GroupNamed GroupId Text
   | TopicChanged GroupId UTCTime (Maybe Tox.PeerId) Text
@@ -116,7 +148,7 @@ data Event
   | TopicAllowed GroupId Bool
   | GroupModerated GroupId UTCTime (Maybe Tox.PeerId) (Maybe Tox.PeerId) Tox.Moderation
     -- ^ Who did it to whom. Nothing means us.
-  | SyncReceived ContactId BS.ByteString
+  | SyncReceived ContactId UTCTime BS.ByteString
     -- ^ Only a linked account's home sends these.
   | FileShared ContactId UTCTime Text Word64 BS.ByteString FilePath
     -- ^ Our file for a linked account's friend, stored as a blob for the
@@ -143,7 +175,9 @@ data Event
     -- ^ Our new avatar as a PNG.
   | RemoveAvatar
   | SetAutoAccept Word64
-  | ToggleFormat Text
+  | SetTypingIndicators Bool
+  | Typing ContactId UTCTime
+    -- ^ The user typed in the friend's chat.
   | SetDevice DeviceSettings
   | AddFriend Text Text
     -- ^ Tox ID and message.
@@ -155,21 +189,25 @@ data Event
     -- ^ Until a time, or forever.
   | UnmuteChat ContactId
   | SendPictures ContactId (Maybe Text)
+  | SendGroupPictures GroupId (Maybe Text)
     -- ^ Picture format to send them, by its key.
   | MarkRead Chat
   | SetDraft Chat Text
   | Stage ContactId Staged
   | Unstage ContactId Int
     -- ^ By its index in the staged list.
-  | ReplyTo ContactId MessageId
-  | CancelReply ContactId
+  | ReplyTo Chat MessageId
+  | CancelReply Chat
   | Send Chat UTCTime
     -- ^ Its draft, with what's staged.
   | SendPrivately GroupId Text UTCTime
     -- ^ The group's draft, to the member with this key.
-  | Forward ContactId [MessageId] ContactId UTCTime
+  | Forward Chat [MessageId] ContactId UTCTime
+    -- ^ Messages of a chat to a friend.
   | Download ContactId MessageId
   | Cancel ContactId MessageId
+  | SendAgain ContactId MessageId
+    -- ^ Our file that was cancelled, from the start.
   | StartCall ContactId UTCTime Bool
     -- ^ With or without the camera.
   | AnswerCall UTCTime Bool
@@ -193,6 +231,22 @@ data Event
   | ChangeSettings GroupId Tox.GroupSettings
   | ChooseRelayBot GroupId (Maybe Text)
     -- ^ Member key of the relay bot, or none.
+  | Pair Text UTCTime
+    -- ^ A new device may pair with this code (it makes us the home).
+  | Unpair Text
+    -- ^ The code stops working.
+  | RemoveDevice ContactId
+  | FileHeld ContactId MessageId BS.ByteString
+    -- ^ The file, stored as a blob for the account's devices.
+  | Wrote ContactId MessageId UTCTime Tox.MessageType BS.ByteString
+    -- ^ A linked device's message to the friend.
+  | WroteFile ContactId MessageId UTCTime FilePath Text Word64
+    -- ^ A linked device's file for the friend: where its blob is, name and
+    -- size.
+  | WroteGroup GroupId MessageId UTCTime Tox.MessageType BS.ByteString
+    -- ^ A linked device's message to the group.
+  | WrotePrivately GroupId MessageId UTCTime Text Tox.MessageType BS.ByteString
+    -- ^ A linked device's message to the member with this key alone.
   deriving (Eq, Show)
 
 data Chat = FriendChat ContactId | GroupChat GroupId
@@ -221,9 +275,14 @@ data Viewing = Viewing
   } deriving (Eq, Show)
 
 update :: Viewing -> Event -> Client -> (Client, [Command])
-update viewing event client = case clientLinked client of
-  Just l  -> linkedUpdate l viewing event client
-  Nothing -> ownUpdate viewing event client
+update viewing event client = case (clientLinked client, clientHome client) of
+  (Just l, _) -> linkedUpdate l viewing event client
+  (Nothing, Just h) -> homeUpdate h viewing event client
+  (Nothing, Nothing) -> case event of
+    -- The first device makes us the home.
+    Pair {} | Just account <- keyOf (Text.take 64 (profileToxId (clientProfile client))) ->
+      homeUpdate (Home.newHome account Sync.emptyStore) viewing event client
+    _ -> ownUpdate viewing event client
 
 -- | Whether the chat has a draft or staged items to send.
 drafted :: Chat -> Client -> Bool
@@ -232,17 +291,34 @@ drafted chat client = case chat of
   GroupChat gid  -> written (Map.lookup gid (clientGroupDrafts client))
   where written = maybe False (not . Text.null . Text.strip)
 
-readable :: AccountSettings -> [Format]
-readable account = [f | f <- formats, formatKey f `Set.notMember` settingFormatsOff account]
 
 forwardable :: Message -> Bool
 forwardable m = isNothing (messageCall m)
   && maybe True (\a -> messageMine m || attachmentState a == Complete) (messageFile m)
 
-quoted :: Message -> Text
-quoted = Text.intercalate "\n" . map ("> " <>) . Text.lines . messageText
+-- | What the chat's draft replies to, quoted to go in front of it.
+replied :: Client -> Chat -> Maybe Text
+replied client chat = quoted <$> case chat of
+  FriendChat cid -> said cid =<< Map.lookup cid (clientReplies client)
+  GroupChat gid  -> groupSaid gid =<< Map.lookup gid (clientGroupReplies client)
+  where
+    quoted = Text.intercalate "\n" . map ("> " <>) . Text.lines
+    said cid i = shownText . messageText <$> (mfilter (isNothing . messageCall) . find ((== i) . messageId) . contactMessages
+      =<< Map.lookup cid (clientContacts client))
+    -- Never what was said privately: the answer may go to everyone.
+    groupSaid gid i = case entryWhat <$> (find ((== i) . entryId) . groupEntries =<< Map.lookup gid (clientGroups client)) of
+      Just (Said _ _ body _ _) -> Just (shownText body)
+      _                        -> Nothing
+
+-- | The draft, after what it replies to.
+replying :: Client -> Chat -> Text -> Text
+replying client chat draft = maybe draft (<> "\n" <> draft) (replied client chat)
 
 -- | For Tox to do.
+-- | A group message for history sync: when, the sender's key (Nothing for
+-- ours), its Tox message ID and what it said.
+type Recalled = (UTCTime, Maybe Text, Word32, History.Body)
+
 data Command
   = SetProfile Profile
   | SetGroupStatus GroupId Tox.UserStatus
@@ -294,6 +370,21 @@ data Command
   | ShareFile ContactId FilePath Text Word64
     -- ^ Store a file as a blob, for the home to send to a linked account's
     -- friend.
+  | FetchGroupFile GroupId Info
+  | PauseGroupDownload GroupId BS.ByteString
+  | LearnGroupFile GroupId Tox.PeerId BS.ByteString
+    -- ^ Get the info of a file the member has.
+  | ShareGroupFile GroupId MessageId FilePath Text
+  | SeedGroupFiles GroupId [(Info, FilePath)]
+    -- ^ The group's files we have whole, for members to fetch from us.
+  | AskHistory GroupId Tox.PeerId
+  | AnswerHistory GroupId Tox.PeerId History.Range [Recalled]
+  | SetTyping ContactId Bool
+  | HoldFile ContactId MessageId FilePath
+    -- ^ Store a file as a blob for the account's devices.
+  | RelayCall ContactId ContactId Bool
+    -- ^ Call the account's device, with video or not, and pass the call
+    -- with the friend to it and back.
   | MeasureDebug
   deriving (Eq, Show)
 
@@ -302,10 +393,35 @@ data Command
 ownUpdate :: Viewing -> Event -> Client -> (Client, [Command])
 ownUpdate viewing event client = case event of
   -- Only a linked account's home sends these.
-  SyncReceived _ _ -> only client
+  SyncReceived {} -> only client
   BlobArrived {} -> only client
   BlobMissing {} -> only client
   FileShared {} -> only client
+  -- For the home of linked devices.
+  Pair {} -> only client
+  Unpair _ -> only client
+  RemoveDevice _ -> only client
+  FileHeld {} -> only client
+  Wrote cid i time kind bytes | Just contact <- Map.lookup cid (clientContacts client) ->
+    let m = (ours (Text.decodeUtf8Lenient bytes) time Nothing i) { messageKind = kind }
+    in ( withContact cid (grown cid contact { contactMessages = contactMessages contact ++ [m] })
+       , [SendMessage cid i (messageText m) 0 | contactOnline contact] )
+  Wrote {} -> only client
+  WroteFile cid i time path name size | Just contact <- Map.lookup cid (clientContacts client) ->
+    ( withContact cid (grown cid contact { contactMessages = contactMessages contact ++ [ours name time (Just (Attachment size path 0 Waiting Nothing)) i] })
+    , [SendFile cid i path name size Nothing | contactOnline contact] )
+  WroteFile {} -> only client
+  WroteGroup gid i time kind bytes | Just g <- Map.lookup gid (clientGroups client), groupPhase g `elem` [Joining, InGroup] ->
+    let text = Text.decodeUtf8Lenient bytes
+    in ( withGroup gid (grownGroup gid g { groupEntries = groupEntries g ++ [GroupEntry time (Said Nothing kind text Pending Nothing) i] })
+       , [SendGroupMessage gid i text | groupPhase g == InGroup] )
+  WroteGroup {} -> only client
+  -- Never to everyone if the member is gone.
+  WrotePrivately gid i time key kind bytes | Just g <- Map.lookup gid (clientGroups client), Just (n, m) <- memberByKey key g ->
+    let text = Text.decodeUtf8Lenient bytes
+    in ( withGroup gid (grownGroup gid g { groupEntries = groupEntries g ++ [GroupEntry time (PrivateTo m kind text Pending) i] })
+       , [SendPrivate gid i n text] )
+  WrotePrivately {} -> only client
   -- For the user to see.
   ToxRefused _ -> only client
   InviteSent {} -> only client
@@ -321,21 +437,22 @@ ownUpdate viewing event client = case event of
     (adjusted cid (\c -> c { contactAvatar = SHA256.hash <$> png }))
       { clientAvatars = maybe id (\p -> Map.insert (SHA256.hash p) p) png (clientAvatars client) }
   SetAutoAccept size -> only client { clientAccount = (clientAccount client) { settingAutoAccept = size } }
-  -- Read their messages again (as Tox carried them if the format is now
-  -- off).
-  ToggleFormat key ->
-    let account = clientAccount client
-        off = settingFormatsOff account
-        account' = account { settingFormatsOff = (if Set.member key off then Set.delete key else Set.insert key) off }
-        reread m = case messageRaw m of
-          Just raw | not (messageMine m) -> m { messageText = readText (readWith (readable account') raw) }
-          _ -> m
-    in only client
-         { clientAccount = account'
-         , clientContacts = (\c -> c { contactMessages = map reread (contactMessages c) }) <$> clientContacts client
-         , clientFormer = (\c -> c { contactMessages = map reread (contactMessages c) }) <$> clientFormer client }
+  SetTypingIndicators on ->
+    let set = client { clientAccount = (clientAccount client) { settingTyping = on } }
+    in if on then only set else foldr stopTyping (only set { clientTyping = Set.empty }) (Map.keys (clientTypingTo client))
+  Typing cid time
+    | settingTyping (clientAccount client)
+    , maybe False contactOnline (Map.lookup cid (clientContacts client)) ->
+        ( client { clientTypingTo = Map.insert cid time (clientTypingTo client) }
+        , [SetTyping cid True | Map.notMember cid (clientTypingTo client)] )
+    | otherwise -> only client
+  FriendTyping cid typing
+    | typing && settingTyping (clientAccount client) -> only client { clientTyping = Set.insert cid (clientTyping client) }
+    | otherwise -> only client { clientTyping = Set.delete cid (clientTyping client) }
   SetDevice device -> only client { clientDevice = device }
-  SetDraft (FriendChat cid) draft -> only client { clientDrafts = Map.insert cid draft (clientDrafts client) }
+  SetDraft (FriendChat cid) draft ->
+    let drafted' = client { clientDrafts = Map.insert cid draft (clientDrafts client) }
+    in if Text.null (Text.strip draft) then stopTyping cid (only drafted') else only drafted'
   SetDraft (GroupChat gid) draft -> only client { clientGroupDrafts = Map.insert gid draft (clientGroupDrafts client) }
   MarkRead (FriendChat cid) -> only $ adjusted cid (\c -> c { contactUnread = 0 })
   MarkRead (GroupChat gid) -> only $ adjustedGroup gid (\g -> g { groupUnread = 0 })
@@ -343,18 +460,20 @@ ownUpdate viewing event client = case event of
     c { contactMessages = inFront messageId page (contactMessages c), contactEarlier = not (null page) }
   EarlierEntries gid page -> only $ adjustedGroup gid $ \g ->
     g { groupEntries = inFront entryId page (groupEntries g), groupEarlier = not (null page) }
-  CloseChat (FriendChat cid) -> only $ adjusted cid (trimmed cid)
-  CloseChat (GroupChat gid) -> only $ adjustedGroup gid trimmedGroup
+  CloseChat (FriendChat cid) -> stopTyping cid (only (adjusted cid (trimmed cid)))
+  CloseChat (GroupChat gid) -> only $ adjustedGroup gid (trimmedGroup gid)
   Send (GroupChat gid) time -> groupSend gid Nothing time
   SendPrivately gid key time -> groupSend gid (Just key) time
   -- Staged items first, then the text.
   Send (FriendChat cid) time
+    | Map.member cid (clientTypingTo client) ->
+        let (sent, commands) = ownUpdate viewing event client { clientTypingTo = Map.delete cid (clientTypingTo client) }
+        in (sent, SetTyping cid False : commands)
     | Just contact <- Map.lookup cid (clientContacts client)
     , let staged = Map.findWithDefault [] cid (clientStaged client)
           draft = maybe "" Text.strip (Map.lookup cid (clientDrafts client))
     , not (null staged) || not (Text.null draft) ->
-        let replied = Map.lookup cid (clientReplies client) >>= \i -> find ((== i) . messageId) (contactMessages contact)
-            message = maybe id (\m t -> quoted m <> "\n" <> t) replied draft
+        let message = replying client (FriendChat cid) draft
             picked = \case
               StagedFile path name size fileId -> ours name time (Just (Attachment size path 0 Waiting (Just fileId)))
               StagedPlace latitude longitude   -> ours (locationText latitude longitude) time Nothing
@@ -434,7 +553,10 @@ ownUpdate viewing event client = case event of
           -- Drop invites we answered, now the friend is back to get the answer.
           spent (c, _) invite = c /= cid || not returned || isNothing (inviteAnswered invite)
       in ( cut { clientContacts = Map.adjust met cid (clientContacts cut)
-               , clientInvites = Map.filterWithKey spent (clientInvites cut) }
+               , clientInvites = Map.filterWithKey spent (clientInvites cut)
+               -- Typing ends with them gone, both ways.
+               , clientTyping = if online then clientTyping cut else Set.delete cid (clientTyping cut)
+               , clientTypingTo = if online then clientTypingTo cut else Map.delete cid (clientTypingTo cut) }
          , [ SendMessage cid (messageId m) (messageText m) (messageParts m)
            | returned
            , m <- contactMessages contact
@@ -478,18 +600,11 @@ ownUpdate viewing event client = case event of
     Nothing -> only client
   MuteChat cid until' -> only $ adjusted cid (\c -> c { contactMute = Just (maybe MutedAlways MutedUntil until') })
   UnmuteChat cid -> only $ adjusted cid (\c -> c { contactMute = Nothing })
-  Received cid time kind bytes
-    -- Drop a message with the same key as an earlier one (some clients resend
-    -- messages).
-    | Just key <- readRepeat got
-    , Just c <- Map.lookup cid (clientContacts client)
-    , key `elem` [ k | m <- contactMessages c, not (messageMine m), Just raw <- [messageRaw m]
-                     , Just k <- [readRepeat (readWith (readable (clientAccount client)) raw)] ] -> only client
-    | otherwise -> only $ using 1 $ adjusted cid $ \c -> grown cid c
-        { contactMessages = contactMessages c ++ [Message False (readText got) time Delivered Nothing Nothing 0 Nothing kind (Just bytes) newId]
-        , contactUnread = contactUnread c + (if reading (FriendChat cid) then 0 else 1)
-        }
-    where got = readWith (readable (clientAccount client)) bytes
+  Received cid time kind bytes -> only $ using 1 $ adjusted cid $ \c -> grown cid c
+    { contactMessages = contactMessages c
+        ++ [Message False (Text.decodeUtf8Lenient bytes) time Delivered Nothing Nothing 0 Nothing kind (Just bytes) newId]
+    , contactUnread = contactUnread c + (if reading (FriendChat cid) then 0 else 1)
+    }
   Delivering cid i delivery -> only $ adjustMessage cid i (\m ->
     if messageDelivery m /= Delivered then m { messageDelivery = delivery } else m) client
   Confirmed cid i n time -> only $ adjustMessage cid i (\m ->
@@ -499,16 +614,24 @@ ownUpdate viewing event client = case event of
          , messageDelivery = if whole then Delivered else messageDelivery m
          , messageDelivered = if whole && isNothing (messageDelivered m) then Just time else messageDelivered m
          }) client
-  ReplyTo cid i
-    | Just m <- messageOf cid i, isNothing (messageCall m) -> only client { clientReplies = Map.insert cid i (clientReplies client) }
-    | otherwise -> only client
-  CancelReply cid -> only client { clientReplies = Map.delete cid (clientReplies client) }
+  ReplyTo chat i ->
+    let replying' = case chat of
+          FriendChat cid -> client { clientReplies = Map.insert cid i (clientReplies client) }
+          GroupChat gid  -> client { clientGroupReplies = Map.insert gid i (clientGroupReplies client) }
+    -- Only to what has words: not to calls or notices.
+    in only (if isJust (replied replying' chat) then replying' else client)
+  CancelReply (FriendChat cid) -> only client { clientReplies = Map.delete cid (clientReplies client) }
+  CancelReply (GroupChat gid) -> only client { clientGroupReplies = Map.delete gid (clientGroupReplies client) }
   Forward source is target time -> case Map.lookup target (clientContacts client) of
     Just contact ->
-      -- In the order of their chat.
-      let sent = [ m | m <- maybe [] contactMessages (Map.lookup source (clientContacts client)), messageId m `elem` is, forwardable m ]
+      -- In the order of their chat. A group's files stay behind.
+      let sent = case source of
+            FriendChat cid -> [ (shownText (messageText m), messageFile m)
+                              | m <- maybe [] contactMessages (Map.lookup cid (clientContacts client)), messageId m `elem` is, forwardable m ]
+            GroupChat gid -> [ (text, Nothing)
+                             | e <- maybe [] groupEntries (Map.lookup gid (clientGroups client)), entryId e `elem` is, Just text <- [entryText e] ]
           copies = zipWith copy sent newIds
-          copy m = ours (messageText m) time (forwardedFile <$> messageFile m)
+          copy (text, file) = ours text time (forwardedFile <$> file)
           forwardedFile a = a { attachmentState = Waiting, attachmentDone = 0, attachmentId = Nothing }
       in ( using (length copies) (withContact target (grown target contact { contactMessages = contactMessages contact ++ copies }))
          , [ case messageFile m of
@@ -555,6 +678,13 @@ ownUpdate viewing event client = case event of
     ( adjustFile cid i (\a -> a { attachmentState = Cancelled })
         client { clientTransfers = maybe id (\ref -> Map.delete (cid, ref)) (liveRef cid i) (clientTransfers client) }
     , [CancelFile cid ref | Just ref <- [liveRef cid i]] )
+  SendAgain cid i
+    | Just m <- messageOf cid i, messageMine m
+    , Just a <- messageFile m, attachmentState a == Cancelled ->
+        ( adjustFile cid i (\b -> b { attachmentState = Waiting, attachmentDone = 0 }) client
+        , [ SendFile cid i (attachmentPath a) (messageText m) (attachmentSize a) (attachmentId a)
+          | maybe False contactOnline (Map.lookup cid (clientContacts client)) ] )
+    | otherwise -> only client
   FileMoved cid ref done -> only $ case Map.lookup (cid, ref) (clientTransfers client) of
     Just i  -> adjustFile cid i (\a -> a { attachmentDone = done, attachmentState = Moving }) client
     Nothing -> client
@@ -613,6 +743,11 @@ ownUpdate viewing event client = case event of
     Just c | callContact c == cid, callPhase c == Calling, callGlare c == Clear ->
       only client { clientCall = Just c { callGlare = Glared time } }
     _ -> ownUpdate viewing (CallEnded cid time) client
+  Tick time
+    | let paused = Map.keys (Map.filter ((>= typingPause) . diffUTCTime time) (clientTypingTo client))
+    , not (null paused) ->
+        let (ticked, commands) = ownUpdate viewing event client { clientTypingTo = foldr Map.delete (clientTypingTo client) paused }
+        in (ticked, map (`SetTyping` False) paused ++ commands)
   Tick time -> case clientCall client of
     Just c
       | Glared since <- callGlare c
@@ -628,6 +763,7 @@ ownUpdate viewing event client = case event of
           ((recorded time (callPhase c == Ringing) c) { clientCall = Nothing }, [HangUpCall (callContact c)])
     _ -> only client
   SendPictures cid way -> only (adjusted cid (\c -> c { contactPictures = way }))
+  SendGroupPictures gid way -> only (adjustedGroup gid (\g -> g { groupPictures = way }))
   Invited cid gid kind name bytes
     | Map.member cid (clientContacts client)
     , maybe True ((`notElem` [Joining, InGroup]) . groupPhase) (Map.lookup gid (clientGroups client)) ->
@@ -652,16 +788,19 @@ ownUpdate viewing event client = case event of
     Just g | groupPhase g == Joining ->
       ( withGroup gid g { groupPhase = InGroup, groupSince = Just time }
       , [SetGroupStatus gid away | let away = profileAway (clientProfile client), away /= Tox.Online]
+        ++ [SeedGroupFiles gid whole | let whole = wholeFiles g, not (null whole)]
         -- Messages written while we weren't in it.
-        ++ [ SendGroupMessage gid i text | GroupEntry _ (Said Nothing _ text Pending) i <- groupEntries g ] )
+        ++ [ SendGroupMessage gid i text | GroupEntry _ (Said Nothing _ text Pending _) i <- groupEntries g ] )
     _ -> only client
   GroupRefused gid why -> case Map.lookup gid (clientGroups client) of
     Just g | groupPhase g `elem` [Joining, InGroup] ->
       -- Quit, or Tox keeps the group around for nothing.
       (withGroup gid g { groupPhase = Refused why, groupMembers = Map.empty, groupSaved = Nothing }, [QuitGroup gid])
     _ -> only client
-  MemberJoined gid time n member -> only $ noting gid $ \g ->
-    (g { groupMembers = Map.insert n member (groupMembers g) }, [GroupEntry time (Arrived member) | arrived g time])
+  -- As totato does, we ask each member that joins for the history it has.
+  MemberJoined gid time n member ->
+    ( noting gid (\g -> (named member g { groupMembers = Map.insert n member (groupMembers g) }, [GroupEntry time (Arrived member) | arrived g time]))
+    , [AskHistory gid n | Just g <- [Map.lookup gid (clientGroups client)], groupKind g == NgcGroup] )
   MemberLeft gid time n how -> only $ noting gid $ \g ->
     ( g { groupMembers = Map.delete n (groupMembers g), groupStatuses = Map.delete n (groupStatuses g) }
     , [ GroupEntry time (Departed member)
@@ -682,16 +821,80 @@ ownUpdate viewing event client = case event of
          -- Messages that went to nobody.
          , [ SendGroupMessage gid i text
            | groupPhase g == InGroup, not (Map.null now)
-           , GroupEntry _ (Said Nothing _ text Pending) i <- groupEntries g ] )
+           , GroupEntry _ (Said Nothing _ text Pending _) i <- groupEntries g ] )
     Nothing -> only client
-  MemberNamed gid n name -> only $ adjustedGroup gid $ \g -> g
-    { groupMembers = Map.adjust (\m -> m { memberName = name }) n (groupMembers g) }
-  GroupReceived gid time n kind text -> only $ noting gid $ \g ->
+  MemberNamed gid n name -> only $ adjustedGroup gid $ \g ->
+    let renamed = Map.adjust (\m -> m { memberName = name }) n (groupMembers g)
+    in maybe id named (Map.lookup n renamed) g { groupMembers = renamed }
+  GroupReceived gid time n kind text mid -> only $ noting gid $ \g ->
     ( g { groupUnread = groupUnread g + (if reading (GroupChat gid) then 0 else 1) }
-    , [GroupEntry time (Said (Just (memberOf g n)) kind text Delivered)] )
-  GroupSent gid i -> only $ adjustedGroup gid $ \g -> g
+    , [GroupEntry time (Said (Just (memberOf g n)) kind text Delivered mid)] )
+  GroupFileShared gid time n mid fid -> only $ noting gid $ \g ->
+    ( g { groupUnread = groupUnread g + (if reading (GroupChat gid) then 0 else 1) }
+    , [GroupEntry time (SharedFile (Just (memberOf g n)) (GroupFile fid Nothing Nothing 0) (Just mid))] )
+  GroupFileLearned gid fid inf -> only $ groupFile gid fid $ \f ->
+    f { groupFileInfo = Just inf, groupFileData = Just (Attachment (Info.size inf) "" 0 Waiting (Just fid)) }
+  DownloadGroupFile gid fid -> case [(inf, a) | GroupEntry _ (SharedFile _ (GroupFile f (Just inf) (Just a) _) _) _ <- maybe [] groupEntries (Map.lookup gid (clientGroups client)), f == fid] of
+    (inf, a) : _ | attachmentState a `elem` [Waiting, Interrupted] ->
+      (groupFile gid fid (\f -> f { groupFileData = Just a { attachmentState = Moving } }), [FetchGroupFile gid inf])
+    _ -> only client
+  PauseGroupFile gid fid
+    | [()] <- [() | GroupEntry _ (SharedFile _ (GroupFile f _ (Just a) _) _) _ <- maybe [] groupEntries (Map.lookup gid (clientGroups client)), f == fid, attachmentState a == Moving] ->
+        (groupFile gid fid (\f -> f { groupFileData = (\a -> a { attachmentState = Interrupted }) <$> groupFileData f, groupFileRate = 0 }), [PauseGroupDownload gid fid])
+    | otherwise -> only client
+  GroupFileMoved gid fid path done rate -> only $ groupFile gid fid $ \f ->
+    f { groupFileData = (\a -> a { attachmentPath = path, attachmentDone = done, attachmentState = Moving }) <$> groupFileData f, groupFileRate = rate }
+  GroupFileEnded gid fid whole -> only $ groupFile gid fid $ \f ->
+    f { groupFileData = (\a -> a { attachmentState = if whole then Complete else Interrupted }) <$> groupFileData f, groupFileRate = 0 }
+  WroteGroupFile gid time path name size | Just g <- Map.lookup gid (clientGroups client), groupPhase g == InGroup ->
+    let file = GroupFile BS.empty Nothing (Just (Attachment size path 0 Moving Nothing)) 0
+    in ( using 1 (withGroup gid (grownGroup gid g { groupEntries = groupEntries g ++ [GroupEntry time (SharedFile Nothing file Nothing) newId] }))
+       , [ShareGroupFile gid newId path name] )
+  WroteGroupFile {} -> only client
+  GroupFileOffered gid i offered -> only $ adjustedGroup gid $ \g -> g
     { groupEntries = [ case e of
-                         GroupEntry t (Said Nothing kind text Pending) j | j == i -> GroupEntry t (Said Nothing kind text Sent) j
+                         GroupEntry t (SharedFile Nothing file _) j | j == i -> GroupEntry t (uncurry (SharedFile Nothing) (ready file)) j
+                         _ -> e
+                     | e <- groupEntries g ] }
+    where
+      ready file = case offered of
+        Just (inf, mid) -> (file { groupFileId = Info.hash inf, groupFileInfo = Just inf, groupFileData = whole inf <$> groupFileData file }, Just mid)
+        Nothing         -> (file { groupFileData = (\a -> a { attachmentState = Cancelled }) <$> groupFileData file }, Nothing)
+      whole inf a = a { attachmentDone = attachmentSize a, attachmentState = Complete, attachmentId = Just (Info.hash inf) }
+  GroupRecalled gid now n names rs | Just g <- Map.lookup gid (clientGroups client) ->
+    let had = Set.fromList ([(memberKey <$> who, mid) | GroupEntry _ (Said who _ _ _ (Just mid)) _ <- groupEntries g]
+                              <> [(memberKey <$> who, mid) | GroupEntry _ (SharedFile who _ (Just mid)) _ <- groupEntries g])
+        -- As totato does: nothing from more than a minute ahead.
+        fresh = nubOrdOn (\(_, who, mid, _) -> (who, mid))
+          [r | r@(t, who, mid, _) <- rs, diffUTCTime t now <= 60, Set.notMember (who, mid) had]
+        -- Senders may have left: then the chat or the store may know them.
+        member key = Member key . fromMaybe "" $
+          (memberName . snd <$> memberByKey key g) <|> Map.lookup key names
+            <|> listToMaybe [memberName m | e <- reverse (groupEntries g), m <- entryMembers (entryWhat e), memberKey m == key, not (Text.null (memberName m))]
+        happenings = [ (t, h) | (t, who, mid, body) <- fresh, Just h <- [happening (member <$> who) mid body] ]
+        happening who mid = \case
+          History.Text action text -> Just (Said who (if action then Tox.MessageAction else Tox.MessageNormal) text (maybe Sent (const Delivered) who) (Just mid))
+          History.Shared kind fid | kind == sha1Info -> Just (SharedFile who (GroupFile fid Nothing Nothing 0) (Just mid))
+          History.Shared {} -> Nothing
+        added = zipWith (\(t, h) i -> GroupEntry t h i) happenings newIds
+        -- After those of the same time, so history keeps its order.
+        placed = foldl (flip (insertBy (comparing entryTime <> \_ _ -> GT))) (groupEntries g) added
+    in ( using (length added) (withGroup gid (grownGroup gid g { groupEntries = placed }))
+       , [LearnGroupFile gid n fid | GroupEntry _ (SharedFile _ file _) _ <- added, let fid = groupFileId file] )
+  GroupRecalled {} -> only client
+  GroupHistoryWanted gid n range -> case Map.lookup gid (clientGroups client) of
+    Just g ->
+      let asker = memberKey (memberOf g n)
+          -- As totato does: nothing from before the asker first joined.
+          since = case [t | GroupEntry t (Arrived m) _ <- groupEntries g, memberKey m == asker] of
+            [] -> Nothing
+            ts -> Just (minimum ts)
+          within t = maybe True (<= t) since && inRange range t
+      in (client, [AnswerHistory gid n range [r | e <- reverse (groupEntries g), within (entryTime e), Just r <- [recalled e]]])
+    Nothing -> only client
+  GroupSent gid i mid -> only $ adjustedGroup gid $ \g -> g
+    { groupEntries = [ case e of
+                         GroupEntry t (Said Nothing kind text Pending _) j | j == i -> GroupEntry t (Said Nothing kind text Sent mid) j
                          GroupEntry t (PrivateTo who kind text Pending) j | j == i -> GroupEntry t (PrivateTo who kind text Sent) j
                          _ -> e
                      | e <- groupEntries g ] }
@@ -757,6 +960,11 @@ ownUpdate viewing event client = case event of
   UnmuteGroup gid -> only $ adjustedGroup gid (\g -> g { groupMute = Nothing })
   where
     only c = (c, [])
+    -- Tells the friend we stopped typing, if we said we were.
+    stopTyping cid (c, commands)
+      | Map.member cid (clientTypingTo c) =
+          (c { clientTypingTo = Map.delete cid (clientTypingTo c) }, commands ++ [SetTyping cid False])
+      | otherwise = (c, commands)
     reading chat = viewingShown viewing && viewingChat viewing == Just chat
     newContact = Contact Nothing False [] 0 Nothing "" Tox.Online Nothing Nothing Nothing False
     ours text time file = Message True text time Pending file Nothing 0 Nothing Tox.MessageNormal Nothing
@@ -781,13 +989,15 @@ ownUpdate viewing event client = case event of
       (Just g, Just text)
         | groupPhase g `elem` [Joining, InGroup], not (Text.null text) ->
             let i = newId
+                message = replying client (GroupChat gid) text
                 sent written commands =
                   ( using 1 $ (withGroup gid (grownGroup gid g { groupEntries = groupEntries g ++ [GroupEntry time written i] }))
-                      { clientGroupDrafts = Map.delete gid (clientGroupDrafts client) }
+                      { clientGroupDrafts = Map.delete gid (clientGroupDrafts client)
+                      , clientGroupReplies = Map.delete gid (clientGroupReplies client) }
                   , commands )
             in case to of
-                 Nothing -> sent (Said Nothing Tox.MessageNormal text Pending) [SendGroupMessage gid i text | groupPhase g == InGroup]
-                 Just key | Just (n, m) <- memberByKey key g -> sent (PrivateTo m Tox.MessageNormal text Pending) [SendPrivate gid i n text]
+                 Nothing -> sent (Said Nothing Tox.MessageNormal message Pending Nothing) [SendGroupMessage gid i message | groupPhase g == InGroup]
+                 Just key | Just (n, m) <- memberByKey key g -> sent (PrivateTo m Tox.MessageNormal message Pending) [SendPrivate gid i n message]
                  -- Never send a private message to everyone if the member is
                  -- gone.
                  Just _ -> only client
@@ -802,14 +1012,15 @@ ownUpdate viewing event client = case event of
       Nothing -> client
     -- Chats not open keep their newest, and those still in use.
     grown cid c = if viewingChat viewing == Just (FriendChat cid) then c else trimmed cid c
-    grownGroup gid g = if viewingChat viewing == Just (GroupChat gid) then g else trimmedGroup g
+    grownGroup gid g = if viewingChat viewing == Just (GroupChat gid) then g else trimmedGroup gid g
     trimmed cid c =
       let kept = newest (viewingPage viewing) (held cid) (contactMessages c)
       in c { contactMessages = kept, contactEarlier = contactEarlier c || length kept < length (contactMessages c) }
-    trimmedGroup g =
-      let kept = newest (viewingPage viewing) entryInUse (groupEntries g)
+    trimmedGroup gid g =
+      let kept = newest (viewingPage viewing) (heldEntry gid) (groupEntries g)
       in g { groupEntries = kept, groupEarlier = groupEarlier g || length kept < length (groupEntries g) }
     held cid m = inUse m || Just (messageId m) `elem` [callEntry =<< clientCall client, Map.lookup cid (clientReplies client)]
+    heldEntry gid e = entryInUse e || Map.lookup gid (clientGroupReplies client) == Just (entryId e)
     -- IDs for what the event adds, in order. 'using' counts those taken.
     newIds = unused (clientIds client)
     newId = nextId (clientIds client)
@@ -821,11 +1032,277 @@ ownUpdate viewing event client = case event of
     -- Joined after Tox met the peers already there.
     arrived g time = groupPhase g == InGroup && maybe False ((>= meeting) . diffUTCTime time) (groupSince g)
     memberOf g n = Map.findWithDefault (Member "" "") n (groupMembers g)
+    groupFile gid fid f = adjustedGroup gid $ \g -> g
+      { groupEntries = [ case e of
+                           GroupEntry t (SharedFile who file mid) j | groupFileId file == fid -> GroupEntry t (SharedFile who (f file) mid) j
+                           _ -> e
+                       | e <- groupEntries g ] }
+    -- Files of the group we have whole, where they are.
+    wholeFiles g = [ (inf, attachmentPath a)
+                   | GroupEntry _ (SharedFile _ (GroupFile _ (Just inf) (Just a) _) _) _ <- groupEntries g, attachmentState a == Complete ]
+    -- History.Range is in seconds, inclusive.
+    inRange r t = let s = floor (utcTimeToPOSIXSeconds t) in s >= History.oldest r && s <= History.newest r
+    recalled e = case entryWhat e of
+      Said who kind text _ (Just mid) -> Just (entryTime e, memberKey <$> who, mid, History.Text (kind == Tox.MessageAction) text)
+      SharedFile who file (Just mid) -> Just (entryTime e, memberKey <$> who, mid, History.Shared sha1Info (groupFileId file))
+      _ -> Nothing
     adjusted cid f = client { clientContacts = Map.adjust f cid (clientContacts client) }
     fileOf cid i = messageFile =<< messageOf cid i
     liveRef cid i = case [ref | ((c, ref), j) <- Map.toList (clientTransfers client), c == cid, j == i] of
       ref : _ -> Just ref
       []      -> Nothing
+
+-- Home of linked devices
+
+-- | For profiles whose account has devices linked here: what happens here
+-- becomes events for them, and what they write is done here.
+homeUpdate :: Home -> Viewing -> Event -> Client -> (Client, [Command])
+homeUpdate h0 viewing event client = case event of
+  Pair code _ -> settled [] (Home.pairWith (Just code) h) (client, [])
+  Unpair code
+    | Home.homePairing h == Just code -> settled [] (Home.pairWith Nothing h) (client, [])
+  RemoveDevice cid | Just pk <- contactKey cid, Home.isDevice pk h ->
+    let (new, h') = writing [(account, Sync.DeviceGone pk)] h
+    in settled new (Home.sessionEnded pk h') (client, [Unfriend cid])
+  -- The devices are Tox friends but not contacts, so Tox gets them here.
+  Started _ -> settled [] h (fmap (++ [Befriend (contactIdOf pk) | pk <- Map.keys (Home.devices h)]) (ownUpdate viewing event client))
+  FriendOnline cid online | Just pk <- contactKey cid, Home.isDevice pk h ->
+    if online then settled [] (Home.sessionStarted pk h) (client, [SendSync cid Home.hello])
+    else settled [] (Home.sessionEnded pk h) (client, [])
+  SyncReceived cid _ packet | Just pk <- contactKey cid ->
+    let (taken, h') = Home.receivePacket pk packet (Recording.liveOf client) h
+    in fromDevice cid taken h'
+  -- A new device with our code.
+  Requested cid message | Just pk <- contactKey cid, Just h' <- Home.paired message h ->
+    let (new, h'') = writing [(account, Sync.Device pk "")] h'
+    in settled new h'' (client, [Befriend cid])
+  BlobArrived blob path small
+    | Just files <- Map.lookup (Sync.BlobId blob) (Home.homeFetching h) ->
+        let h' = h { Home.homeFetching = Map.delete (Sync.BlobId blob) (Home.homeFetching h) }
+        in settled [] h' (applying [ \_ -> [WroteFile cid (MessageId i) (Linked.eventTime e) path name size]
+                                   | Sync.EventId i <- files, Just e <- [Sync.lookupEvent (Sync.EventId i) (Home.homeStore h)]
+                                   , Sync.File _ _ name size _ _ <- [Sync.eventContent e], Just cid <- [friendOf h (Sync.eventGraph e)] ] client)
+    | Home.homeAvatar h == Just (Sync.BlobId blob), Just png <- small ->
+        settled [] h { Home.homeAvatar = Nothing } (ownUpdate viewing (SetAvatar png) client)
+  BlobMissing blob -> missing [Sync.BlobId blob]
+  FileHeld _ i blob | Just e <- Recording.eventOf h i ->
+    let (new, h') = writing [(Sync.eventGraph e', Sync.FileEnded e True (Just (Sync.BlobId blob))) | Just e' <- [Sync.lookupEvent e (Home.homeStore h)]]
+                      h { Home.homeHolding = Set.delete e (Home.homeHolding h) }
+    in settled new h' (client, [])
+  -- Older messages from the store aren't new.
+  EarlierMessages {} -> homeRecorded True [] h client (ownUpdate viewing event client)
+  -- What became of a device's new chat.
+  GroupCreated gid _ _ _ | i : rest <- Home.homeFounding h ->
+    let (c, commands) = ownUpdate viewing event client
+        chat = chatIdOf gid =<< Map.lookup gid (clientGroups c)
+        (new, h') = writing [(account, Sync.ChatJoined i chat)] h { Home.homeFounding = rest }
+    in settled new h' (c, commands)
+  ToxRefused (FoundingRefused _) | i : rest <- Home.homeFounding h ->
+    let (new, h') = writing [(account, Sync.ChatJoined i Nothing)] h { Home.homeFounding = rest }
+    in settled new h' (ownUpdate viewing event client)
+  -- Devices don't call the account: it calls them.
+  CallInvited cid _ _ | Just pk <- contactKey cid, Home.isDevice pk h -> settled [] h (client, [HangUpCall cid])
+  -- The device's end of a call we relay: the friend's ends with it.
+  CallEnded cid time | relayedTo cid -> settled [] h (ownUpdate viewing (HangUp time) client)
+  CallGlared cid time | relayedTo cid -> settled [] h (ownUpdate viewing (HangUp time) client)
+  CallPeer cid _ _ | Just pk <- contactKey cid, Home.isDevice pk h -> settled [] h (client, [])
+  -- The friend answered the call a device placed: now we call the device.
+  CallPeer cid _ _
+    | Just c <- clientCall client, callContact c == cid, callPhase c == Calling, Just device <- callDevice c ->
+        settled [] h (fmap (++ [RelayCall cid device (callCamera c)]) (ownUpdate viewing event client))
+  _ -> settled [] h (ownUpdate viewing event client)
+  where
+    relayedTo cid = maybe False ((== Just cid) . callDevice) (clientCall client)
+    -- A device answers or places the friend's call, or hangs it up. Only
+    -- one call goes on at a time.
+    deviceCall device (Sync.PublicKey f) action c =
+      let friend = ContactId (hexOf f)
+          time = Home.homeClock h
+      in case (action, clientCall c) of
+        (Protocol.Connect video, Just call)
+          | callContact call == friend, callPhase call == Ringing, isNothing (callDevice call) ->
+              ( c { clientCall = Just call { callPhase = Talking time, callCamera = video, callDevice = Just device } }
+              , [AnswerFriend friend video, RelayCall friend device video] )
+        (Protocol.Connect video, Nothing) ->
+          let (c', commands) = ownUpdate viewing (StartCall friend time video) c
+          in (c' { clientCall = (\call -> call { callDevice = Just device }) <$> clientCall c' }, commands)
+        (Protocol.HangUp, Just call)
+          | callContact call == friend, maybe (callPhase call == Ringing) (== device) (callDevice call) ->
+              ownUpdate viewing (HangUp time) c
+        _ -> (c, [])
+    h = h0 { Home.homeClock = maybe (Home.homeClock h0) (max (Home.homeClock h0)) (timeOf event) }
+    account = Sync.accountGraph (Home.homeAccount h)
+    settled new h' result = homeRecorded False new h' client result
+    -- Each after the ones before, as the user would do them.
+    applying actions c = foldl (\(c', cs) act -> foldl (\(c'', cs') e -> fmap (cs' ++) (ownUpdate viewing e c'')) (c', cs) (act c')) (c, []) actions
+    writing = Recording.writeAll (Home.homeClock h)
+    -- What a device sent: replies, its events done here, and blobs.
+    fromDevice cid taken h' =
+      let (h'', actions, commands) = foldl (acting cid) (h', [], []) (Home.takenEvents taken)
+          (c, done) = foldl (\(c', cs) (friend, action) -> fmap (cs ++) (deviceCall cid friend action c'))
+                        (applying actions client) (Home.takenCalls taken)
+          (failed, h3) = failing (Home.takenMissing taken) h''
+      in homeRecorded False ([(i, bytes) | (i, _, bytes) <- Home.takenEvents taken] ++ failed) h3 client
+           (c, [SendSync cid (Home.takenReplies taken) | not (null (Home.takenReplies taken))]
+                 ++ [ServeBlob cid blob (Linked.noBlob (Sync.BlobId blob)) | Sync.BlobId blob <- Home.takenWanted taken]
+                 ++ commands ++ done)
+    missing blobs = let (failed, h') = failing blobs h in settled failed h' (client, [])
+    -- Devices' files whose blobs didn't come fail, and so does an avatar.
+    failing blobs h' =
+      let files = concat [Map.findWithDefault [] b (Home.homeFetching h') | b <- blobs]
+          (new, h'') = writing [ (Sync.eventGraph e, Sync.FileEnded i False Nothing)
+                               | i <- files, Just e <- [Sync.lookupEvent i (Home.homeStore h')] ] h'
+      in (new, h'' { Home.homeFetching = foldr Map.delete (Home.homeFetching h'') blobs
+                   , Home.homeAvatar = mfilter (`notElem` blobs) (Home.homeAvatar h'') })
+    acting cid (h', actions, commands) (i@(Sync.EventId bytes), e, _) = case Sync.eventContent e of
+      Sync.Send _ said kind | Just friend <- friendOf h' g ->
+        (h', actions ++ [const [Wrote friend (MessageId bytes) (Linked.eventTime e) (toxKind kind) said]], commands)
+      Sync.FileAnswered file accepted | Just friend <- friendOf h' g, Just mid <- messageFor h' file ->
+        (h', actions ++ [const [if accepted then Download friend mid else Cancel friend mid]], commands)
+      Sync.File _ _ name _ False (Just blob@(Sync.BlobId b)) | Just _ <- friendOf h' g ->
+        ( h' { Home.homeFetching = Map.insertWith (flip (++)) blob [i] (Home.homeFetching h') }
+        , actions, commands ++ [FetchBlob cid b (Home.askBlob blob) (Just name)] )
+      Sync.ReadUpTo g' _ rank | Just friend <- friendOf h' g', maybe True ((<= rank) . fst) (Map.lookup g' (Home.homeLatest h')) ->
+        (h', actions ++ [const [MarkRead (FriendChat friend)]], commands)
+      Sync.WantFriend pk message nospam -> let friend = contactIdOf pk in
+        (h', actions ++ [\c -> if Map.member friend (clientRequests c) then [AcceptRequest friend]
+                               else [ AddFriend (toxId (keyHex pk) (nospamText n)) (fromMaybe "" message)
+                                    | Map.notMember friend (clientContacts c), Just n <- [nospam] ]], commands)
+      Sync.UnwantFriend pk -> let friend = contactIdOf pk in
+        (h', actions ++ [\c -> [DeleteContact friend True | Map.member friend (clientContacts c)]
+                               ++ [RejectRequest friend | Map.member friend (clientRequests c)]], commands)
+      Sync.Wish Sync.AccountSubject v -> case v of
+        Sync.Name n -> (h', actions ++ [\c -> [ChangeProfile n (profileStatus (clientProfile c))]], commands)
+        Sync.StatusMessage t -> (h', actions ++ [\c -> [ChangeProfile (profileNickname (clientProfile c)) t]], commands)
+        Sync.Status st -> (h', actions ++ [const [SetAway (toEnum (fromEnum st))]], commands)
+        Sync.Avatar Nothing -> (h', actions ++ [const [RemoveAvatar]], commands)
+        Sync.Avatar (Just blob@(Sync.BlobId b)) ->
+          (h' { Home.homeAvatar = Just blob }, actions, commands ++ [FetchBlob cid b (Home.askBlob blob) Nothing])
+        _ -> (h', actions, commands)
+      Sync.SettingContent (Sync.ConversationScope g') setting | Just friend <- friendOf h' g' -> case Sync.keptValue setting of
+        Sync.Mute until' _ -> (h', actions ++ [const [MuteChat friend (Linked.fromMillis . fromIntegral <$> until')]], commands)
+        Sync.PictureFormat way -> (h', actions ++ [const [SendPictures friend (picturesOf way)]], commands)
+        _ -> (h', actions, commands)
+      Sync.ClearSetting (Sync.ConversationScope g') kind | Just friend <- friendOf h' g' ->
+        (h', actions ++ [const ([UnmuteChat friend | fromIntegral kind == muteKind] ++ [SendPictures friend Nothing | fromIntegral kind == picturesKind])], commands)
+      Sync.DeviceGone pk -> (Home.sessionEnded pk h', actions, commands ++ [Unfriend (contactIdOf pk)])
+      -- Groups and conferences.
+      Sync.Send _ said kind | Just gid <- groupFor g ->
+        (h', actions ++ [const [WroteGroup gid (MessageId bytes) (Linked.eventTime e) (toxKind kind) said]], commands)
+      Sync.SendPrivately (Sync.PublicKey to) _ said kind | Just gid <- groupFor g ->
+        (h', actions ++ [const [WrotePrivately gid (MessageId bytes) (Linked.eventTime e) (hexOf to) (toxKind kind) said]], commands)
+      Sync.ReadUpTo g' _ rank | Just gid <- groupFor g', maybe True ((<= rank) . fst) (Map.lookup g' (Home.homeLatest h')) ->
+        (h', actions ++ [const [MarkRead (GroupChat gid)]], commands)
+      Sync.NewChat kind name privacy ->
+        ( h' { Home.homeFounding = Home.homeFounding h' ++ [i] }
+        , actions ++ [const [Found (case (kind, privacy) of
+                                      (Sync.ConferenceKind, _) -> NewConference
+                                      (_, Sync.Private)        -> PrivateGroup
+                                      _                        -> PublicGroup) name]], commands )
+      Sync.JoinChat chatId password ->
+        ( h' { Home.homeJoining = Home.homeJoining h' ++ [(i, chatId)] }
+        , actions ++ [const [JoinPublic (GroupId (hexOf chatId)) (fromMaybe "" password)]], commands )
+      Sync.InviteToChat c (Sync.PublicKey friend) ->
+        (h', actions ++ [const [InviteFriend (chatGroupId c) (ContactId (hexOf friend))]], commands)
+      Sync.AnswerInvite invite join password | Just (cid', gid) <- inviteHere invite ->
+        (h', actions ++ [const [AnswerInvite cid' gid (if join then Just (fromMaybe "" password) else Nothing)]], commands)
+      Sync.RelayBot c (Sync.PublicKey bot) relays ->
+        (h', actions ++ [const [ChooseRelayBot (chatGroupId c) (if relays then Just (hexOf bot) else Nothing)]], commands)
+      Sync.Wish (Sync.ChatSubject c) v -> let gid = chatGroupId c in case v of
+        Sync.Topic topic -> (h', actions ++ [const [SetTopic gid topic]], commands)
+        Sync.Joined False -> (h', actions ++ [const [LeaveGroup gid]], commands)
+        _ -> (h', actions ++ [\c' -> [ ChangeSettings gid (wished v settings)
+                                     | Just settings <- [groupSettings =<< Map.lookup gid (clientGroups c')] ]], commands)
+      Sync.Wish (Sync.PeerSubject c pk) v -> let gid = chatGroupId c in
+        (h', actions ++ [\c' -> [ Moderate gid n act
+                                | Just g' <- [Map.lookup gid (clientGroups c')], Just (n, _) <- [memberByKey (keyHex pk) g']
+                                , Just act <- [case v of
+                                                 Sync.Present False -> Just Kick
+                                                 Sync.RoleValue Sync.Moderator -> Just MakeModerator
+                                                 Sync.RoleValue Sync.User -> Just MakeUser
+                                                 Sync.RoleValue Sync.Observer -> Just MakeObserver
+                                                 _ -> Nothing] ]], commands)
+      Sync.SettingContent (Sync.ConversationScope g') setting | Just gid <- groupFor g', Sync.Mute until' mentioned <- Sync.keptValue setting ->
+        (h', actions ++ [\c' -> MuteGroup gid (Linked.fromMillis . fromIntegral <$> until')
+                                : [ToggleMentions gid | maybe False ((/= mentioned) . groupMentions) (Map.lookup gid (clientGroups c'))]], commands)
+      Sync.SettingContent (Sync.ConversationScope g') setting | Just gid <- groupFor g', Sync.PictureFormat way <- Sync.keptValue setting ->
+        (h', actions ++ [const [SendGroupPictures gid (picturesOf way)]], commands)
+      Sync.ClearSetting (Sync.ConversationScope g') kind | Just gid <- groupFor g' ->
+        (h', actions ++ [const ([UnmuteGroup gid | fromIntegral kind == muteKind] ++ [SendGroupPictures gid Nothing | fromIntegral kind == picturesKind])], commands)
+      _ -> (h', actions, commands)
+      where g = Sync.eventGraph e
+    groupFor g = listToMaybe [gid | (gid, grp) <- Map.toList (clientGroups client), Just c <- [chatIdOf gid grp], Sync.chatGraph c == g]
+    -- The invite here that the account's invite event is about.
+    inviteHere invite = case Map.lookup invite (Sync.accountInvites (Home.homeState h)) of
+      Just v -> listToMaybe [ (cid', gid) | ((cid', gid), here) <- Map.toList (clientInvites client)
+                            , contactKey cid' == Just (Sync.inviteFrom v), inviteData here == Sync.inviteData v ]
+      Nothing -> Nothing
+    wished v settings = case v of
+      Sync.PrivacyValue p -> settings { Tox.groupPrivate = p == Sync.Private }
+      Sync.PeerLimit n -> settings { Tox.groupPeerLimit = fromIntegral n }
+      Sync.Password p -> settings { Tox.groupPassword = Text.encodeUtf8 p }
+      Sync.TopicLock locked -> settings { Tox.groupTopicLock = locked }
+      Sync.VoiceStateValue voice -> settings { Tox.groupVoice = case voice of
+        Sync.VoiceEveryone   -> Tox.VoiceAll
+        Sync.VoiceModerators -> Tox.VoiceModerators
+        Sync.VoiceFounder    -> Tox.VoiceFounder }
+      _ -> settings
+    nospamText n = hexOf (BS.pack [fromIntegral (n `shiftR` s) | s <- [24, 16, 8, 0]])
+    toxKind Sync.Action = Tox.MessageAction
+    toxKind Sync.Normal = Tox.MessageNormal
+
+-- | Writes what changed as events for the devices, and sends them. New
+-- messages and entries take their events' IDs, also in the commands.
+homeRecorded :: Bool -> [(Sync.EventId, BS.ByteString)] -> Home -> Client -> (Client, [Command]) -> (Client, [Command])
+homeRecorded paging taken h old (client, commands) =
+  ( Recording.renamedIn renames client { clientHome = Just home }
+  , map renamedCommand commands
+      ++ [SendSync (contactIdOf pk) packets | (pk, packets) <- Home.pushed (Recording.recordedNew r) home ++ Recording.recordedLive r]
+      ++ map StoreBlob (Recording.recordedBlobs r)
+      ++ [HoldFile cid (renamed i) path | (cid, i, path) <- Recording.recordedHolds r] )
+  where
+    r = Recording.record paging taken h old client
+    home = Recording.recordedHome r
+    renames = Recording.recordedRenames r
+    renamed i = Map.findWithDefault i i renames
+    renamedCommand = \case
+      SendMessage cid i text n -> SendMessage cid (renamed i) text n
+      SendFile cid i path name size fileId -> SendFile cid (renamed i) path name size fileId
+      SendGroupMessage gid i text -> SendGroupMessage gid (renamed i) text
+      SendPrivate gid i n text -> SendPrivate gid (renamed i) n text
+      other -> other
+
+-- | The message ID of an event.
+messageFor :: Home -> Sync.EventId -> Maybe MessageId
+messageFor h i@(Sync.EventId bytes) = case [m | (m, e) <- Map.toList (Home.homeEarlier h), e == i] of
+  m : _ -> Just (MessageId m)
+  []    -> Just (MessageId bytes)
+
+-- | The friend an account's chat is with, by the chat's graph.
+friendOf :: Home -> Sync.GraphId -> Maybe ContactId
+friendOf h g = listToMaybe
+  [ contactIdOf pk | (pk, f) <- Map.toList (Sync.accountFriends (Home.homeState h)), Sync.friendWanted f
+  , Sync.friendGraph (Home.homeAccount h) pk == g ]
+
+-- | When it happened, for events that say.
+timeOf :: Event -> Maybe UTCTime
+timeOf = \case
+  Received _ t _ _ -> Just t
+  Tick t -> Just t
+  Send _ t -> Just t
+  FileOffered _ _ t _ _ _ _ -> Just t
+  CallInvited _ t _ -> Just t
+  CallEnded _ t -> Just t
+  Typing _ t -> Just t
+  StartCall _ t _ -> Just t
+  AnswerCall t _ -> Just t
+  HangUp t -> Just t
+  Forward _ _ _ t -> Just t
+  Pair _ t -> Just t
+  SyncReceived _ t _ -> Just t
+  CallPeer _ t _ -> Just t
+  CallGlared _ t -> Just t
+  _ -> Nothing
 
 -- Linked accounts
 
@@ -840,7 +1317,7 @@ linkedUpdate l viewing event client = case event of
   FriendOnline cid online
     | cid == home && online -> (client, [SendSync home (Linked.homeOnline l)])
     | cid == home -> linked (Linked.homeOffline l) client []
-  SyncReceived cid packet
+  SyncReceived cid _ packet
     | cid == home ->
         let (replies, asked, l') = Linked.receivePacket packet l
             (c, commands) = linked l' client replies
@@ -853,22 +1330,22 @@ linkedUpdate l viewing event client = case event of
           _                                    -> clientAvatars client
     in linked here client { clientAvatars = avatars } []
   -- The home accepts theirs, then we fetch it from the home.
-  Download cid i | Just (fid, file) <- linkedFileAt l i -> case linkedEnd l fid of
+  Download cid i | Just (fid, file) <- linkedFileAt l i -> case Map.lookup fid (linkedEnds l) of
     Just (True, Just blob) ->
       let (l', commands) = fetchFile l blob file in (fst (linked l' client []), commands)
     Nothing | Map.notMember fid (linkedAnswers l) ->
       let (l', packets) = authored (friendGraphOf cid) now (Sync.FileAnswered fid True) l in linked l' client packets
     _ -> only client
-  Cancel cid i | Just (fid, _) <- linkedFileAt l i, isNothing (linkedEnd l fid) ->
+  -- The home device has our file.
+  SendAgain {} -> only client
+  Cancel cid i | Just (fid, _) <- linkedFileAt l i, Map.notMember fid (linkedEnds l) ->
     let (l', packets) = authored (friendGraphOf cid) now (Sync.FileAnswered fid False) l in linked l' client packets
   -- Staged items first, then the text. Files go once stored as blobs.
   Send (FriendChat cid) time
     | let staged = Map.findWithDefault [] cid (clientStaged client)
           draft = maybe "" Text.strip (Map.lookup cid (clientDrafts client))
     , not (null staged) || not (Text.null draft) ->
-        let replied = Map.lookup cid (clientReplies client) >>= \i ->
-              find ((== i) . messageId) . contactMessages =<< Map.lookup cid (clientContacts client)
-            text = maybe id (\m t -> quoted m <> "\n" <> t) replied draft
+        let text = replying client (FriendChat cid) draft
             g = friendGraphOf cid
             said = [locationText latitude longitude | StagedPlace latitude longitude <- staged]
               ++ [text | not (Text.null draft)]
@@ -900,6 +1377,7 @@ linkedUpdate l viewing event client = case event of
   MuteGroup gid until' | Just c <- chatOf gid ->
     setting muteKind (Sync.chatGraph c) (Just (muteOf until' (maybe True groupMentions (Map.lookup gid (clientGroups client)))))
   UnmuteGroup gid | Just c <- chatOf gid -> setting muteKind (Sync.chatGraph c) Nothing
+  SendGroupPictures gid way | Just c <- chatOf gid -> setting picturesKind (Sync.chatGraph c) (Sync.PictureFormat <$> (syncPictures =<< way))
   ToggleMentions gid
     | Just c <- chatOf gid, Just g <- Map.lookup gid (clientGroups client), Just m <- groupMute g ->
         setting muteKind (Sync.chatGraph c) (Just (muteOf (case m of MutedUntil t -> Just t; MutedAlways -> Nothing)
@@ -983,6 +1461,9 @@ linkedUpdate l viewing event client = case event of
   CallGlared cid time | cid == home, Just friend <- relaying -> viaHome (ownUpdate viewing (CallEnded friend time) client)
   Moderate {} -> wishing
   ChangeSettings {} -> wishing
+  -- Only for accounts whose Tox runs here.
+  Typing {} -> only client
+  FriendTyping {} -> only client
   _ -> readToEnd viewing l (fst (ownUpdate viewing event client)) []
   where
     only c = (c, [])
@@ -999,9 +1480,10 @@ linkedUpdate l viewing event client = case event of
     groupSend gid time content
       | Just c <- chatOf gid
       , Just draft <- Text.strip <$> Map.lookup gid (clientGroupDrafts client), not (Text.null draft)
-      , Just made <- content (Sync.chatGraph c) (Text.encodeUtf8 draft) =
+      , Just made <- content (Sync.chatGraph c) (Text.encodeUtf8 (replying client (GroupChat gid) draft)) =
           let (l', packets) = authored (Sync.chatGraph c) time made l
-          in linked l' client { clientGroupDrafts = Map.delete gid (clientGroupDrafts client) } packets
+          in linked l' client { clientGroupDrafts = Map.delete gid (clientGroupDrafts client)
+                              , clientGroupReplies = Map.delete gid (clientGroupReplies client) } packets
       | otherwise = only client
     relaying = case clientCall client of
       Just c | callVia c == Just home -> Just (callContact c)
@@ -1045,10 +1527,6 @@ linkedUpdate l viewing event client = case event of
                    , (differs Tox.groupTopicLock, Sync.TopicLock (Tox.groupTopicLock new))
                    , (differs Tox.groupVoice, Sync.VoiceStateValue (syncVoice (Tox.groupVoice new))) ] ]
       _ -> []
-    syncVoice = \case
-      Tox.VoiceAll        -> Sync.VoiceEveryone
-      Tox.VoiceModerators -> Sync.VoiceModerators
-      Tox.VoiceFounder    -> Sync.VoiceFounder
     friendWish (ContactId key) wanted = case keyOf key of
       Just pk ->
         let content = if wanted then Sync.WantFriend pk Nothing Nothing else Sync.UnwantFriend pk
@@ -1068,21 +1546,6 @@ linkedUpdate l viewing event client = case event of
     nospamOf t = case unhex' t of
       Just bytes | BS.length bytes == 4 -> Just (BS.foldl' (\n b -> n * 256 + fromIntegral b) 0 bytes)
       _ -> Nothing
-
-muteKind, picturesKind :: Word64
-muteKind = Sync.settingKind (Sync.Mute Nothing True)
-picturesKind = Sync.settingKind (Sync.PictureFormat Sync.Original)
-
--- | Our picture format key as a sync encoding ('picturesOf' turns it back).
-syncPictures :: Text -> Maybe Sync.PictureEncoding
-syncPictures key
-  | key == Pictures.formatKey Pictures.qoi = Just Sync.Qoi
-  | otherwise = Nothing
-
-picturesOf :: Sync.PictureEncoding -> Maybe Text
-picturesOf = \case
-  Sync.Qoi      -> Just (Pictures.formatKey Pictures.qoi)
-  Sync.Original -> Nothing
 
 withLinked :: Viewing -> Linked -> Client -> [BS.ByteString] -> (Client, [Command])
 withLinked viewing l client = readToEnd viewing l (linkedView l client { clientLinked = Just l })
@@ -1124,10 +1587,12 @@ fetching l client = foldl (\(l', commands) (blob, file) -> (<>) commands <$> fet
     missing = [ blob | Linked.inSession l, blob <- avatarBlobs l, Map.notMember blob (clientAvatars client)
                      , Set.notMember (Sync.BlobId blob) (Linked.linkedWanted l) ]
     files = [ (blob, file) | (fid, file@(_, size)) <- linkedFiles l
-                           , size <= settingAutoAccept (clientAccount client) || Map.lookup fid (linkedAnswers l) == Just True
-                           , Just (True, Just blob) <- [linkedEnd l fid] ]
+                           , size <= settingAutoAccept (clientAccount client) || Map.lookup fid answers == Just True
+                           , Just (True, Just blob) <- [Map.lookup fid ends] ]
       -- Ours, stored here as blobs (to find them again after a restart).
       ++ linkedOurs l
+    ends = linkedEnds l
+    answers = linkedAnswers l
     home = ContactId (Text.toUpper (Text.take 64 (linkedHomeAddress l)))
     ask (l', commands) blob =
       let (packets, l'') = Linked.wantBlob (Sync.BlobId blob) l' in (l'', commands ++ [FetchBlob home blob packets Nothing])
@@ -1156,11 +1621,11 @@ linkedOurs l =
                          , Sync.File _ _ name size False (Just blob) <- [Sync.eventContent e] ]
   where store = Replica.replicaStore (Linked.linkedReplica l)
 
--- | How a file ended, if it did: OK or not, and the home's blob.
-linkedEnd :: Linked -> Sync.EventId -> Maybe (Bool, Maybe Sync.BlobId)
-linkedEnd l fid = listToMaybe
-  [ (ok, blob) | g <- Sync.storeGraphs store, (_, e) <- reverse (Sync.byRank g store)
-               , Sync.FileEnded i ok blob <- [Sync.eventContent e], i == fid ]
+-- | How each file ended, if it did: OK or not, and the home's blob.
+linkedEnds :: Linked -> Map Sync.EventId (Bool, Maybe Sync.BlobId)
+linkedEnds l = Map.unions
+  [ Map.fromList [ (i, (ok, blob)) | (_, e) <- Sync.byRank g store, Sync.FileEnded i ok blob <- [Sync.eventContent e] ]
+  | g <- Sync.storeGraphs store ]
   where store = Replica.replicaStore (Linked.linkedReplica l)
 
 -- | Latest accept or decline of each file.
@@ -1199,20 +1664,24 @@ linkedSender l g = fromMaybe ourName (listToMaybe
     facts = Sync.accountFacts state
     ourName = fromMaybe "" (listToMaybe [n | Sync.Name n <- Sync.factsOf Sync.AccountSubject facts])
 
-keyOf :: Text -> Maybe Sync.PublicKey
-keyOf key = case unhex' key of
-  Just bytes | BS.length bytes == 32 -> Just (Sync.PublicKey bytes)
-  _                                  -> Nothing
+-- | A chat's events in display order, and what later events say of
+-- earlier ones.
+data Thread = Thread
+  { threadGraph   :: Sync.GraphId
+  , threadEvents  :: [(Sync.EventId, Sync.Event)]
+  , threadSent    :: Set Sync.EventId
+  , threadArrived :: Map Sync.EventId UTCTime
+  , threadEnded   :: Map Sync.EventId (Maybe Word64, Bool)
+  }
 
-unhex' :: Text -> Maybe BS.ByteString
-unhex' = either (const Nothing) Just . Base16.decode . Text.encodeUtf8
-
-hexOf :: BS.ByteString -> Text
-hexOf = Text.toUpper . Text.decodeUtf8 . Base16.encode
-
-chatGroupId :: Sync.ChatId -> GroupId
-chatGroupId (Sync.GroupChat i)      = GroupId (hexOf i)
-chatGroupId (Sync.ConferenceChat i) = GroupId (hexOf i)
+threadIn :: Sync.GraphId -> Sync.EventStore -> Thread
+threadIn g store = Thread g events
+  (Set.fromList [i | Sync.Sent i <- contents])
+  (Map.fromList [(i, Linked.eventTime e) | (_, e) <- events, Sync.Delivered i <- [Sync.eventContent e]])
+  (Map.fromList [(i, (d, declined)) | Sync.CallEnded i d declined <- contents])
+  where
+    events = Sync.displayOrder g store
+    contents = map (Sync.eventContent . snd) events
 
 -- | Chats, friends, invites and profile of a linked account, from its
 -- events and the home's live facts.
@@ -1256,28 +1725,24 @@ linkedView l client = client
     avatarOf s = listToMaybe [blob | Sync.Avatar (Just (Sync.BlobId blob)) <- kept s]
     ringing (ContactId key) = or
       [ True | Just pk <- [keyOf key], Sync.CallValue (Sync.Ringing _) <- Sync.factsOf (Sync.FriendSubject pk) live ]
-    contactIdOf (Sync.PublicKey pk) = ContactId (hexOf pk)
     idOf (Sync.EventId i) = MessageId i
     memberKey' (Sync.PublicKey pk) = hexOf pk
     toxKind Sync.Action = Tox.MessageAction
     toxKind Sync.Normal = Tox.MessageNormal
-    readable' = readable (clientAccount client)
-    timeline g = Sync.displayOrder g store
-    went g = Set.fromList [i | (_, e) <- timeline g, Sync.Sent i <- [Sync.eventContent e]]
-    arrived g = Map.fromList [(i, Linked.eventTime e) | (_, e) <- timeline g, Sync.Delivered i <- [Sync.eventContent e]]
-    ended g = Map.fromList [(i, (d, declined)) | (_, e) <- timeline g, Sync.CallEnded i d declined <- [Sync.eventContent e]]
-    delivery g i
-      | Map.member i (arrived g) = Delivered
-      | Set.member i (went g) = Sent
+    ends = linkedEnds l
+    answers = linkedAnswers l
+    delivery thread i
+      | Map.member i (threadArrived thread) = Delivered
+      | Set.member i (threadSent thread) = Sent
       | otherwise = Pending
     -- Theirs after the last read and since the link (earlier ones were for
     -- the other devices to notify). Only missed calls count.
-    unread g theirs = length
-      [ () | (i, e) <- timeline g
-      , unreadIn state g e
+    unread thread theirs = length
+      [ () | (i, e) <- threadEvents thread
+      , unreadIn state (threadGraph thread) e
       , Linked.eventTime e >= Linked.linkedSince l
       , theirs (i, e) ]
-    theirMessage g = maybe False (\m -> not (messageMine m) && maybe True recordMissed (messageCall m)) . message g
+    theirMessage thread = maybe False (\m -> not (messageMine m) && maybe True recordMissed (messageCall m)) . message thread
     theirEntry (_, e) = case Sync.eventContent e of
       Sync.Received {}          -> True
       Sync.ReceivedPrivately {} -> True
@@ -1286,38 +1751,40 @@ linkedView l client = client
       Just (Sync.Kept (Sync.Mute until' mentioned) _) ->
         Just (maybe MutedAlways (MutedUntil . Linked.fromMillis . fromIntegral) until', mentioned)
       _ -> Nothing
+    picturesIn g = case Sync.keptValue <$> (Map.lookup picturesKind =<< Map.lookup (Sync.ConversationScope g) (Sync.accountSettings state)) of
+      Just (Sync.PictureFormat way) -> picturesOf way
+      _                             -> Nothing
     contact pk = Contact
       { contactName = listToMaybe [n | Sync.Name n <- kept subject]
       , contactOnline = or [c /= Sync.NoConnection | Sync.ConnectionValue c <- Sync.factsOf subject live]
-      , contactMessages = mapMaybe (message g) (timeline g)
-      , contactUnread = unread g (theirMessage g)
+      , contactMessages = mapMaybe (message thread) (threadEvents thread)
+      , contactUnread = unread thread (theirMessage thread)
       , contactRequest = Nothing
       , contactStatusMessage = fromMaybe "" (listToMaybe [t | Sync.StatusMessage t <- kept subject])
       , contactStatus = fromMaybe Tox.Online (listToMaybe [toEnum (fromEnum st) | Sync.Status st <- Sync.factsOf subject live])
       , contactMute = fst <$> muteIn g
       , contactAvatar = avatarOf subject
-      , contactPictures = case Sync.keptValue <$> (Map.lookup picturesKind =<< Map.lookup (Sync.ConversationScope g) (Sync.accountSettings state)) of
-          Just (Sync.PictureFormat way) -> picturesOf way
-          _                             -> Nothing
+      , contactPictures = picturesIn g
       , contactEarlier = False
       }
       where
         subject = Sync.FriendSubject pk
         g = Sync.friendGraph account pk
-    message g (i, e) = case Sync.eventContent e of
+        thread = threadIn g store
+    message thread (i, e) = case Sync.eventContent e of
       Sync.Received _ _ bytes kind ->
-        Just (Message False (readText (readWith readable' bytes)) t Delivered Nothing Nothing 0 Nothing (toxKind kind) (Just bytes) (idOf i))
+        Just (Message False (Text.decodeUtf8Lenient bytes) t Delivered Nothing Nothing 0 Nothing (toxKind kind) (Just bytes) (idOf i))
       Sync.Send _ bytes kind ->
-        Just (Message True (Text.decodeUtf8Lenient bytes) t (delivery g i) Nothing Nothing 0 (Map.lookup i (arrived g)) (toxKind kind) Nothing (idOf i))
+        Just (Message True (Text.decodeUtf8Lenient bytes) t (delivery thread i) Nothing Nothing 0 (Map.lookup i (threadArrived thread)) (toxKind kind) Nothing (idOf i))
       Sync.CallStarted _ incoming video ->
-        let (talked, declined) = case Map.lookup i (ended g) of
+        let (talked, declined) = case Map.lookup i (threadEnded thread) of
               Just (d, no) -> (fromIntegral <$> d, no)
               Nothing      -> (Nothing, False)
-            missed = incoming && Map.member i (ended g) && isNothing talked && not declined
+            missed = incoming && Map.member i (threadEnded thread) && isNothing talked && not declined
         in Just (Message (not incoming) "" t Delivered Nothing
                    (Just (CallRecord video ((/ 1000) <$> talked) missed)) 0 Nothing Tox.MessageNormal Nothing (idOf i))
       Sync.File _ _ name size incoming blob ->
-        let end = linkedEnd l i
+        let end = Map.lookup i ends
             held = case end of
               Just (_, b) -> b <|> blob
               Nothing     -> blob
@@ -1329,7 +1796,7 @@ linkedView l client = client
               Just (True, Just b) | Set.member b (Linked.linkedMissing l) -> Cancelled
                                   | Set.member b (Linked.linkedWanted l) -> Moving
               Just (True, _) -> if incoming then Waiting else Complete
-              Nothing -> case Map.lookup i (linkedAnswers l) of
+              Nothing -> case Map.lookup i answers of
                 Just True  -> Moving
                 Just False -> Cancelled
                 Nothing    -> if incoming then Waiting else Moving
@@ -1339,13 +1806,15 @@ linkedView l client = client
       _ -> Nothing
       where t = Linked.eventTime e
     group c = (newGroup name (if isGroup then NgcGroup else TextConference) InGroup)
-      { groupEntries = mapMaybe (entry g peerName) (timeline g)
-      , groupUnread = unread g theirEntry
+      { groupEntries = mapMaybe (entry thread peerName) (threadEvents thread)
+      , groupUnread = unread thread theirEntry
       , groupMembers = Map.fromList [(n, Member (memberKey' pk) (peerName pk)) | (n, pk) <- peers]
       , groupMute = fst <$> muteIn g
       , groupMentions = maybe True snd (muteIn g)
+      , groupPictures = picturesIn g
       , groupTopic = fromMaybe "" (listToMaybe [t | Sync.Topic t <- kept subject])
-      , groupMayTopic = not locked || selfRole `elem` [Just Tox.Founder, Just Tox.Moderator]
+      -- As Tox allows: anyone but observers, or only moderators while locked.
+      , groupMayTopic = selfRole /= Just Tox.Observer && (not locked || selfRole `elem` [Just Tox.Founder, Just Tox.Moderator])
       , groupRoles = Map.fromList [(n, role) | (n, pk) <- peers, Sync.RoleValue r <- peerFacts pk, let role = toxRole r]
       , groupStatuses = Map.fromList
           [(n, status) | (n, pk) <- peers, Sync.Status st <- peerFacts pk, let status = toEnum (fromEnum st), status /= Tox.Online]
@@ -1360,6 +1829,7 @@ linkedView l client = client
       }
       where
         g = Sync.chatGraph c
+        thread = threadIn g store
         subject = Sync.ChatSubject c
         isGroup = case c of
           Sync.GroupChat _ -> True
@@ -1371,22 +1841,35 @@ linkedView l client = client
         -- A member who left has no facts, so use the name of their last
         -- message.
         peerName pk = fromMaybe "" (listToMaybe [n | Sync.Name n <- peerFacts pk] <|> Map.lookup pk wroteAs)
-        wroteAs = Map.fromList $ flip mapMaybe (timeline g) $ \(_, e) -> case Sync.eventContent e of
+        wroteAs = Map.fromList $ flip mapMaybe (threadEvents thread) $ \(_, e) -> case Sync.eventContent e of
           Sync.Received (Just pk) said _ _   -> Just (pk, said)
           Sync.ReceivedPrivately pk said _ _ -> Just (pk, said)
           _                                  -> Nothing
         -- Our own numbers (Tox's are on the home).
         peers = zip [0 ..] [pk | (Sync.PeerSubject c' pk, Sync.Present True) <- Sync.allFacts live, c' == c]
-    entry g nameOf (i, e) = (\what -> GroupEntry (Linked.eventTime e) what (idOf i)) <$> case Sync.eventContent e of
+    entry thread nameOf (i, e) = (\what -> GroupEntry (Linked.eventTime e) what (idOf i)) <$> case Sync.eventContent e of
       Sync.Received from sender bytes kind ->
-        Just (Said (Just (Member (maybe "" memberKey' from) sender)) (toxKind kind) (readText (readWith readable' bytes)) Delivered)
-      Sync.Send _ bytes kind -> Just (Said Nothing (toxKind kind) (Text.decodeUtf8Lenient bytes) (delivery g i))
+        Just (Said (Just (Member (maybe "" memberKey' from) sender)) (toxKind kind) (Text.decodeUtf8Lenient bytes) Delivered Nothing)
+      Sync.Send _ bytes kind -> Just (Said Nothing (toxKind kind) (Text.decodeUtf8Lenient bytes) (delivery thread i) Nothing)
       Sync.ReceivedPrivately from sender bytes kind ->
-        Just (PrivateFrom (Member (memberKey' from) sender) (toxKind kind) (readText (readWith readable' bytes)))
+        Just (PrivateFrom (Member (memberKey' from) sender) (toxKind kind) (Text.decodeUtf8Lenient bytes))
       Sync.SendPrivately to _ bytes kind ->
-        Just (PrivateTo (Member (memberKey' to) (nameOf to)) (toxKind kind) (Text.decodeUtf8Lenient bytes) (delivery g i))
+        Just (PrivateTo (Member (memberKey' to) (nameOf to)) (toxKind kind) (Text.decodeUtf8Lenient bytes) (delivery thread i))
       Sync.Notice t -> Just (Noted t)
+      Sync.PeerJoined pk name -> Just (Arrived (Member (memberKey' pk) name))
+      Sync.PeerLeft pk name -> Just (Departed (Member (memberKey' pk) name))
+      Sync.PeerRenamed pk old name -> Just (Noted (memberLabel (Member (memberKey' pk) old) <> " is now known as " <> name))
+      Sync.TopicSet by name topic -> Just (TopicSet (Just (someone by name)) topic)
+      Sync.TitleSet by name title -> Just (Noted (memberLabel (someone by name) <> " changed the title to " <> title))
+      Sync.Moderated by name peer peerName role ->
+        Moderated (Just (someone by name)) (Just (someone peer peerName)) <$> maybe (Just Tox.ModKick) moderation role
       _ -> Nothing
+    someone = Member . maybe "" memberKey'
+    moderation = \case
+      Sync.Moderator -> Just Tox.ModModerator
+      Sync.User      -> Just Tox.ModUser
+      Sync.Observer  -> Just Tox.ModObserver
+      Sync.Founder   -> Nothing
     toxRole = \case
       Sync.Founder   -> Tox.Founder
       Sync.Moderator -> Tox.Moderator
@@ -1411,6 +1894,39 @@ inFront key page have = filter ((`Set.notMember` Set.fromList (map key have)) . 
 newest :: Int -> (a -> Bool) -> [a] -> [a]
 newest n used xs = drop (minimum (length xs - n : [i | (i, x) <- zip [0 ..] xs, used x])) xs
 
+-- | Gives the member's name to their entries that have none, as from
+-- history before they joined.
+named :: Member -> Group -> Group
+named m g
+  | Text.null (memberName m) = g
+  | otherwise = g { groupEntries = [e { entryWhat = withName (entryWhat e) } | e <- groupEntries g] }
+  where
+    withName = \case
+      Said who kind text d mid    -> Said (fill <$> who) kind text d mid
+      PrivateFrom who kind text   -> PrivateFrom (fill who) kind text
+      PrivateTo who kind text d   -> PrivateTo (fill who) kind text d
+      Moderated by whom how       -> Moderated (fill <$> by) (fill <$> whom) how
+      Arrived who                 -> Arrived (fill who)
+      Departed who                -> Departed (fill who)
+      TopicSet who topic          -> TopicSet (fill <$> who) topic
+      SharedFile who file mid     -> SharedFile (fill <$> who) file mid
+      Noted t                     -> Noted t
+    fill who
+      | memberKey who == memberKey m, Text.null (memberName who) = who { memberName = memberName m }
+      | otherwise = who
+
+entryMembers :: Happening -> [Member]
+entryMembers = \case
+  Said who _ _ _ _     -> maybe [] pure who
+  PrivateFrom who _ _  -> [who]
+  PrivateTo who _ _ _  -> [who]
+  Moderated by whom _  -> maybe [] pure by <> maybe [] pure whom
+  Arrived who          -> [who]
+  Departed who         -> [who]
+  TopicSet who _       -> maybe [] pure who
+  SharedFile who _ _   -> maybe [] pure who
+  Noted _              -> []
+
 -- | Nothing if they've left.
 memberByKey :: Text -> Group -> Maybe (Tox.PeerId, Member)
 memberByKey key g = find ((== key) . memberKey . snd) (Map.toList (groupMembers g))
@@ -1423,7 +1939,7 @@ adjustMessage cid i f client = client { clientContacts = Map.adjust contact cid 
 adjustFile :: ContactId -> MessageId -> (Attachment -> Attachment) -> Client -> Client
 adjustFile cid i f = adjustMessage cid i (\m -> m { messageFile = f <$> messageFile m })
 
--- | Transfer that Tox ended early. Both ours and theirs wait to be offered
+-- | A transfer that Tox ended early. Both ours and theirs wait to be offered
 -- again and resume, but only if they have a file ID.
 interrupted :: Message -> Message
 interrupted m = m { messageFile = cut <$> messageFile m }

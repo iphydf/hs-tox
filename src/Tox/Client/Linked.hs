@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Profile whose account runs on another device (its home). We keep a
+{-# LANGUAGE StrictData        #-}
+-- | A profile whose account runs on another device (its home). We keep a
 -- replica in sync over Tox. Screens are derived from its events, and what
 -- the user does becomes events.
 module Tox.Client.Linked
@@ -105,7 +106,7 @@ newLinked home pairing since device store = Linked
 homeKeyOf :: Text -> PublicKey
 homeKeyOf = PublicKey . fromRight BS.empty . Base16.decode . Text.encodeUtf8 . Text.take 64
 
--- | Also the account's key (the home runs it on Tox).
+-- | The home's key, which is also the account's (the home runs it on Tox).
 homeKey :: Linked -> PublicKey
 homeKey = homeKeyOf . linkedHome
 
@@ -183,7 +184,7 @@ callAction friend = Frame.frames . encodeMessage . Call friend
 noBlob :: BlobId -> [BS.ByteString]
 noBlob = Frame.frames . encodeMessage . NoBlob
 
--- | New event by us, with the packets for the home.
+-- | A new event by us, with the packets for the home.
 author :: GraphId -> UTCTime -> Content -> Linked -> (EventId, [BS.ByteString], Linked)
 author graph time content l = (i, concatMap (Frame.frames . encodeMessage) pushed, refreshed l { linkedReplica = replica })
   where (i, _, pushed, replica) = Replica.author graph (toMillis time) content (linkedReplica l)

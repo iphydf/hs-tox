@@ -7,7 +7,7 @@ import           Test.Hspec
 
 import           Tox.Client.Qoi
 
--- | QOI file with this body.
+-- | A QOI file with this body.
 picture :: Int -> Int -> [Word8] -> BS.ByteString
 picture w h body = BS.pack $
   [0x71, 0x6f, 0x69, 0x66] ++ be32 w ++ be32 h ++ [4, 0] ++ body ++ [0, 0, 0, 0, 0, 0, 0, 1]

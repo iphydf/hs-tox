@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE StrictData #-}
 -- | Our messages in flight: parts Tox holds and parts the friend confirmed.
 -- We can send a message again at any time and only the missing parts go.
 module Tox.Client.Outgoing

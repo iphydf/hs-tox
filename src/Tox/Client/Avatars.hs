@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE StrictData #-}
 -- | Avatar transfers, as Tox clients do them: avatar-kind files whose ID is
 -- the SHA-256, up to 64 KiB. Empty means no avatar. Kept in memory.
 module Tox.Client.Avatars
