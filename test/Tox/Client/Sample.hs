@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Client with friends and chats, made from events.
+-- | A client with friends and chats, made from events.
 module Tox.Client.Sample
   ( alice
   , bob
@@ -22,6 +22,8 @@ import qualified Data.Text                   as Text
 import           Data.Time                   (UTCTime (..), fromGregorian,
                                               secondsToDiffTime)
 import qualified Tox.Application.Tox         as Tox
+import qualified Tox.AV                      as AV
+import qualified Tox.AV.Playout              as Playout
 import qualified Tox.Network.Core.PacketKind as PacketKind
 
 import           Tox.Client
@@ -109,4 +111,7 @@ sampleReport = Debug.Report
       , (Tox.RelayLink Tox.Sent, Tox.Count 2 3072)
       , (Tox.Requests Tox.SearchFriend, Tox.Count 7 1400)
       ]
+  , Debug.reportCalls =
+      [ Debug.Call "1d16d2ab" (Playout.Stats 3 1 2 0) (Just (AV.VideoStats 600 5 7 22 2 3 66 598 0))
+          (Just "c2.exynos.h264.encoder, NV12 480x640 in rows of 512, planes of 640") ]
   }

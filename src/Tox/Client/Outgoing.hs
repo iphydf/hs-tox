@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE StrictData #-}
 -- | Our messages in flight: parts Tox holds and parts the friend confirmed.
 -- We can send a message again at any time and only the missing parts go.
 module Tox.Client.Outgoing
@@ -18,7 +19,7 @@ import qualified Data.Map.Strict         as Map
 import           Data.Text               (Text)
 import           Data.Time               (UTCTime, getCurrentTime)
 import           Data.Word               (Word32)
-import qualified Tox.Application.Tox     as Tox
+import qualified Tox.Client.Toxcore      as Tox
 import           Tox.Crypto.Core.Key     (PublicKey)
 
 import           Tox.Client.Messages     (parts)

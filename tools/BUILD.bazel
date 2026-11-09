@@ -1,0 +1,99 @@
+load("@rules_haskell//haskell:defs.bzl", "haskell_binary", "haskell_library")
+
+haskell_library(
+    name = "echobot-avatar",
+    srcs = ["Avatar.hs"],
+    extra_srcs = ["echobot.png"],
+    ghcopts = ["-DAVATAR=\"$(location echobot.png)\""],
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    deps = [
+        "//third_party/haskell:base",
+        "//third_party/haskell:bytestring",
+        "//third_party/haskell:file-embed",
+    ],
+)
+
+haskell_binary(
+    name = "echobot",
+    srcs = ["echobot.hs"],
+    ghcopts = [
+        "-j4",
+        "-threaded",
+    ],
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    deps = [
+        ":echobot-avatar",
+        "//hs-tox",
+        "//hs-toxav",
+        "//hs-toxcore:tox-application",
+        "//hs-toxcore:tox-chat",
+        "//hs-toxcore:tox-core",
+        "//hs-toxcore:tox-crypto",
+        "//hs-toxcore:tox-session",
+        "//third_party/haskell:base",
+        "//third_party/haskell:base16-bytestring",
+        "//third_party/haskell:bytestring",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:directory",
+        "//third_party/haskell:filepath",
+        "//third_party/haskell:http-client",
+        "//third_party/haskell:http-client-tls",
+        "//third_party/haskell:optparse-applicative",
+        "//third_party/haskell:saltine",
+        "//third_party/haskell:text",
+        "//third_party/haskell:time",
+    ],
+)
+
+haskell_binary(
+    name = "group-peer",
+    srcs = ["group-peer.hs"],
+    ghcopts = [
+        "-j4",
+        "-threaded",
+    ],
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    deps = [
+        "//hs-tox",
+        "//hs-toxcore:tox-core",
+        "//hs-toxsync",
+        "//third_party/haskell:base",
+        "//third_party/haskell:base16-bytestring",
+        "//third_party/haskell:bytestring",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:filepath",
+        "//third_party/haskell:text",
+        "//third_party/haskell:time",
+    ],
+)
+
+sh_test(
+    name = "group_share_test",
+    size = "large",
+    srcs = ["group-share-test.sh"],
+    args = [
+        "$(location //hs-toxsync/tools:tox-share-peer)",
+        "$(location :group-peer)",
+    ],
+    data = [
+        ":group-peer",
+        "//hs-toxsync/tools:tox-share-peer",
+    ],
+    # In its own network, as LAN discovery finds the peers of tests running
+    # at the same time.
+    tags = [
+        "block-network",
+        "haskell",
+        "no-cross",
+        "no-windows",
+    ],
+)

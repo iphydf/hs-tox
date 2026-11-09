@@ -4,11 +4,15 @@ module Tox.Client.UpdateSpec (spec) where
 import qualified Data.ByteString     as BS
 import           Data.List           (nub)
 import qualified Data.Map.Strict     as Map
+import qualified Data.Set            as Set
 import qualified Data.Text           as Text
 import qualified Data.Text.Encoding  as TextEncoding
 import           Data.Time           (addUTCTime)
 import           Test.Hspec
 import qualified Tox.Application.Tox as Tox
+import qualified Tox.Share.History   as History
+import qualified Tox.Share.Info      as Info
+import           Tox.Share.Packet    (sha1Info)
 
 import           Tox.Client
 import           Tox.Client.Sample
@@ -48,15 +52,114 @@ spec = do
     groupPhase <$> groupOf (applying (events ++ [GroupRefused team Tox.JoinFailBadPassword]) sample)
       `shouldBe` Just (Refused Tox.JoinFailBadPassword)
 
+  it "tells a friend we're typing once, and that we stopped after a pause, on sending, or with the draft gone" $ do
+    let second n = addUTCTime n (at 3 9 0)
+        typed = [Typing alice (second 0)]
+        again = typed ++ [Typing alice (second 1)]
+    commands [] (Typing alice (second 0)) `shouldBe` [SetTyping alice True]
+    commands typed (Typing alice (second 1)) `shouldBe` []
+    commands again (Tick (second 3)) `shouldBe` []
+    commands again (Tick (second 4)) `shouldBe` [SetTyping alice False]
+    commands typed (SetDraft (FriendChat alice) " ") `shouldBe` [SetTyping alice False]
+    commands (typed ++ [SetDraft (FriendChat alice) "hi"]) (Send (FriendChat alice) (second 1))
+      `shouldContain` [SetTyping alice False]
+    commands typed (CloseChat (FriendChat alice)) `shouldContain` [SetTyping alice False]
+    commands [] (Typing bob (second 0)) `shouldBe` []
+
+  it "shows a friend typing until they stop or go offline" $ do
+    let typing = [FriendTyping alice True]
+    clientTyping (applying typing sample) `shouldBe` Set.singleton alice
+    clientTyping (applying (typing ++ [FriendTyping alice False]) sample) `shouldBe` Set.empty
+    clientTyping (applying (typing ++ [FriendOnline alice False]) sample) `shouldBe` Set.empty
+    commands [Typing alice (at 3 9 0)] (FriendOnline alice False) `shouldBe` []
+    commands [Typing alice (at 3 9 0), FriendOnline alice False] (Tick (at 3 9 1)) `shouldBe` []
+
+  it "neither tells nor shows typing with typing indicators off" $ do
+    let off = [SetTypingIndicators False]
+    commands off (Typing alice (at 3 9 0)) `shouldBe` []
+    clientTyping (applying (off ++ [FriendTyping alice True]) sample) `shouldBe` Set.empty
+    commands [Typing alice (at 3 9 0)] (SetTypingIndicators False) `shouldBe` [SetTyping alice False]
+    clientTyping (applying [FriendTyping alice True, SetTypingIndicators False] sample) `shouldBe` Set.empty
+
+  it "shows a file shared in the group, and downloads it only when asked" $ do
+    let inf = Info.Info "cat.png" 1000 1000 (BS.replicate 20 1)
+        fid = Info.hash inf
+        shared = inGroup ++ [GroupFileShared team (at 3 9 1) 1 7 fid, GroupFileLearned team fid inf]
+        fetched = shared ++ [DownloadGroupFile team fid, GroupFileMoved team fid "/files/cat.png" 1000 0, GroupFileEnded team fid True]
+    concatMap (commands inGroup) (drop (length inGroup) shared) `shouldBe` []
+    commands shared (DownloadGroupFile team fid) `shouldBe` [FetchGroupFile team inf]
+    map entryWhat . groupEntries <$> groupOf (applying fetched sample)
+      `shouldBe` Just [SharedFile (Just dana) (GroupFile fid (Just inf) (Just (Attachment 1000 "/files/cat.png" 1000 Complete (Just fid))) 0) (Just 7)]
+
+  it "shares our file once it's hashed, and serves the group's whole files again once back in" $ do
+    let inf = Info.Info "cat.png" 1000 1000 (BS.replicate 20 1)
+        fid = Info.hash inf
+        wrote = inGroup ++ [WroteGroupFile team (at 3 9 1) "/sent/cat.png" "cat.png" 1000]
+        ours = entryAt team 0 (applying wrote sample)
+        offered = wrote ++ [GroupFileOffered team ours (Just (inf, 9))]
+        whole = Attachment 1000 "/sent/cat.png" 1000 Complete (Just fid)
+    commands inGroup (WroteGroupFile team (at 3 9 1) "/sent/cat.png" "cat.png" 1000) `shouldBe` [ShareGroupFile team ours "/sent/cat.png" "cat.png"]
+    map entryWhat . groupEntries <$> groupOf (applying offered sample)
+      `shouldBe` Just [SharedFile Nothing (GroupFile fid (Just inf) (Just whole) 0) (Just 9)]
+    commands offered (GroupHistoryWanted team 1 (History.Range maxBound 0))
+      `shouldBe` [AnswerHistory team 1 (History.Range maxBound 0) [(at 3 9 1, Nothing, 9, History.Shared sha1Info fid)]]
+    commands (offered ++ [Started ""]) (GroupConnected team (at 3 9 2))
+      `shouldContain` [SeedGroupFiles team [(inf, "/sent/cat.png")]]
+
+  it "pauses a download, and goes on with it when asked" $ do
+    let inf = Info.Info "cat.png" 1000 1000 (BS.replicate 20 1)
+        fid = Info.hash inf
+        moving = inGroup ++ [GroupFileShared team (at 3 9 1) 1 7 fid, GroupFileLearned team fid inf, DownloadGroupFile team fid]
+    commands moving (PauseGroupFile team fid) `shouldBe` [PauseGroupDownload team fid]
+    commands (moving ++ [PauseGroupFile team fid]) (DownloadGroupFile team fid) `shouldBe` [FetchGroupFile team inf]
+
+  it "asks each member that joins for history, and adds what it didn't have in time order" $ do
+    let carl = Member (Text.replicate 8 "CA470000") "Carl"
+        fid = BS.replicate 20 2
+        said = inGroup ++ [GroupReceived team (at 3 9 5) 1 Tox.MessageNormal "hi" (Just 5)]
+        recalled =
+          [ (at 3 9 2, Just (memberKey carl), 3, History.Text False "early")
+          , (at 3 9 5, Just (memberKey dana), 5, History.Text False "hi")
+          , (at 3 9 3, Nothing, 4, History.Shared sha1Info fid)
+          , (at 3 10 0, Just (memberKey dana), 6, History.Text False "from the future") ]
+    commands inGroup (MemberJoined team (at 3 9 1) 2 carl) `shouldBe` [AskHistory team 2]
+    commands said (GroupRecalled team (at 3 9 6) 1 Map.empty recalled) `shouldBe` [LearnGroupFile team 1 fid]
+    map entryWhat . groupEntries <$> groupOf (applying (said ++ [GroupRecalled team (at 3 9 6) 1 Map.empty recalled]) sample)
+      `shouldBe` Just
+        [ Said (Just (Member (memberKey carl) "")) Tox.MessageNormal "early" Delivered (Just 3)
+        , SharedFile Nothing (GroupFile fid Nothing Nothing 0) (Just 4)
+        , Said (Just dana) Tox.MessageNormal "hi" Delivered (Just 5) ]
+
+  it "names senders in history by what the chat knows, or once they join" $ do
+    let carl = Member (Text.replicate 8 "CA470000") "Carl"
+        eve = Member (Text.replicate 8 "E0E00000") "Eve"
+        left = inGroup ++ [MemberJoined team (at 3 9 1) 2 carl, MemberLeft team (at 3 9 3) 2 Tox.ExitQuit]
+        recalled =
+          [ (at 3 9 2, Just (memberKey carl), 3, History.Text False "from carl")
+          , (at 3 9 2, Just (memberKey eve), 4, History.Text False "from eve") ]
+        senders = map (\e -> [memberName m | Said (Just m) _ _ _ _ <- [entryWhat e]]) . maybe [] groupEntries . groupOf
+        heard = left ++ [GroupRecalled team (at 3 9 6) 1 Map.empty recalled]
+    concat (senders (applying heard sample)) `shouldBe` ["Carl", ""]
+    concat (senders (applying (heard ++ [MemberJoined team (at 3 9 7) 3 eve]) sample)) `shouldBe` ["Carl", "Eve"]
+
+  it "answers a history request with what was said since the asker joined" $ do
+    let carl = Member (Text.replicate 8 "CA470000") "Carl"
+        events = inGroup ++
+          [ GroupReceived team (at 3 9 1) 1 Tox.MessageNormal "before" (Just 1), MemberJoined team (at 3 9 2) 2 carl
+          , GroupReceived team (at 3 9 3) 1 Tox.MessageNormal "after" (Just 2) ]
+        everything = History.Range maxBound 0
+    commands events (GroupHistoryWanted team 2 everything)
+      `shouldBe` [AnswerHistory team 2 everything [(at 3 9 3, Just (memberKey dana), 2, History.Text False "after")]]
+
   it "names messages by their sender, and tells who came and went once in the group" $ do
     let carl = Member (Text.replicate 8 "CA470000") "Carl"
         events = inGroup ++
           -- Joined with Dana, while Tox is still meeting the peers.
           [ MemberJoined team (at 3 9 0) 3 (Member (Text.replicate 8 "E0E00000") "Eve")
-          , MemberJoined team (at 3 9 1) 2 carl, GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "hi"
+          , MemberJoined team (at 3 9 1) 2 carl, GroupReceived team (at 3 9 2) 1 Tox.MessageNormal "hi" (Just 5)
           , MemberLeft team (at 3 9 3) 2 Tox.ExitQuit ]
     map entryWhat . groupEntries <$> groupOf (applying events sample)
-      `shouldBe` Just [Arrived carl, Said (Just dana) Tox.MessageNormal "hi" Delivered, Departed carl]
+      `shouldBe` Just [Arrived carl, Said (Just dana) Tox.MessageNormal "hi" Delivered (Just 5), Departed carl]
 
   it "finds mentions as whole words in any case" $ do
     map (mentions "Tox User") ["hi tox user!", "@Tox User: look", "Tox Users", "xTox User", "Tox"]
@@ -83,7 +186,7 @@ spec = do
     commands (take 1 joined) (AnswerInvite alice talk (Just "")) `shouldBe` [JoinConference alice talk "cookie"]
     commands (init joined) (Send (GroupChat talk) (at 3 9 1)) `shouldBe` [SendGroupMessage talk early "early"]
     commands joined (MembersListed talk (at 3 9 2) [(1, dana)]) `shouldBe` [SendGroupMessage talk early "early"]
-    let later = joined ++ [GroupSent talk early, MembersListed talk (at 3 9 2) [(1, dana)], MembersListed talk (at 3 9 3) [(2, carl)], GroupSaved talk "state"]
+    let later = joined ++ [GroupSent talk early (Just 6), MembersListed talk (at 3 9 2) [(1, dana)], MembersListed talk (at 3 9 3) [(2, carl)], GroupSaved talk "state"]
         g = Map.lookup talk (clientGroups (applying later sample))
     map entryWhat . drop 1 . groupEntries <$> g `shouldBe` Just [Arrived carl, Departed dana]
     commands later (Started "") `shouldContain` [RestoreGroup AudioConference talk "state"]
@@ -107,7 +210,7 @@ spec = do
         privately = SendPrivately team (memberKey dana) (at 3 9 1)
         psst = entryAt team 0 (applying (written ++ [privately]) sample)
     commands written privately `shouldBe` [SendPrivate team psst 1 "psst"]
-    let both = written ++ [privately, GroupSent team psst, PrivateReceived team (at 3 9 2) 1 Tox.MessageNormal "hush"]
+    let both = written ++ [privately, GroupSent team psst Nothing, PrivateReceived team (at 3 9 2) 1 Tox.MessageNormal "hush"]
     map entryWhat . groupEntries <$> groupOf (applying both sample)
       `shouldBe` Just [PrivateTo dana Tox.MessageNormal "psst" Sent, PrivateFrom dana Tox.MessageNormal "hush"]
     -- Nothing once they're gone.
@@ -127,25 +230,22 @@ spec = do
     (groupPhase <$> groupOf kicked, groupSaved =<< groupOf kicked) `shouldBe` (Just Kicked, Nothing)
     commands [] (Moderate team 2 Kick) `shouldBe` [ModerateMember team 2 Kick]
 
-  it "shows TRIfA's messages as Tox carried them while the user wants" $ do
-    let trailer = BS.pack ([0, 0] ++ replicate 32 7 ++ [0, 0, 0, 1])
-        received = [Received alice (at 3 9 0) Tox.MessageNormal ("hi" <> trailer)]
-        texts' events = map messageText (drop 3 (messagesOf alice (applying events sample)))
-    texts' received `shouldBe` ["hi"]
-    texts' (received ++ [ToggleFormat "message_v3"]) `shouldBe` [TextEncoding.decodeUtf8Lenient ("hi" <> trailer)]
-    texts' (ToggleFormat "message_v3" : received ++ received) `shouldBe` replicate 2 (TextEncoding.decodeUtf8Lenient ("hi" <> trailer))
-
-  it "shows a message sent again once" $ do
-    let trifa = "again" <> BS.pack (0 : 0 : replicate 32 7 ++ [0, 0, 0, 1])
-    drop 3 (map messageText (messagesOf alice (applying (replicate 2 (Received alice (at 3 9 1) Tox.MessageNormal trifa)) sample)))
-      `shouldBe` ["again"]
+  it "keeps what follows a message's zero byte, showing, quoting and forwarding only what comes before" $ do
+    let bytes = "hi" <> BS.pack [0, 7, 7] <> "secret"
+        received = [Received alice (at 3 9 0) Tox.MessageNormal bytes]
+        got = last (messagesOf alice (applying received sample))
+        forwarded = applying (received ++ [Forward (FriendChat alice) [messageId got] bob (at 3 9 1)]) sample
+        answering = applying (received ++ [ReplyTo (FriendChat alice) (messageId got)]) sample
+    (messageText got, messageRaw got) `shouldBe` (TextEncoding.decodeUtf8Lenient bytes, Just bytes)
+    (shownText (messageText got), replied answering (FriendChat alice)) `shouldBe` ("hi", Just "> hi")
+    messageText (last (messagesOf bob forwarded)) `shouldBe` "hi"
 
   it "sends what was written while joining, and rejoins from what Tox kept at a start" $ do
     let written = take 2 inGroup ++ [SetDraft (GroupChat team) "early", Send (GroupChat team) (at 3 9 0)]
         early = entryAt team 0 (applying written sample)
     commands written (Send (GroupChat team) (at 3 9 0)) `shouldBe` []
     commands written (GroupConnected team (at 3 9 0)) `shouldBe` [SendGroupMessage team early "early"]
-    let kept = written ++ [GroupConnected team (at 3 9 0), GroupSent team early, GroupSaved team "state"]
+    let kept = written ++ [GroupConnected team (at 3 9 0), GroupSent team early (Just 6), GroupSaved team "state"]
     commands kept (Started "") `shouldContain` [RestoreGroup NgcGroup team "state"]
     groupPhase <$> groupOf (applying (kept ++ [Started ""]) sample) `shouldBe` Just Joining
 
@@ -258,6 +358,23 @@ spec = do
     commands returned (theirs 2 "theirs") `shouldBe` [AcceptFile alice (Receiving 2) "/received/b.txt"]
     files (returned ++ [theirs 2 "theirs"]) `shouldBe` [Waiting, Moving]
     files (returned ++ [theirs 2 "other"]) `shouldBe` [Waiting, Interrupted, Moving]
+
+  it "sends our cancelled file again from the start, now or when the friend is back" $ do
+    let ours = [Stage alice (StagedFile "/sent/a.png" "a.png" 10 "ours"), Send (FriendChat alice) (at 3 9 0)]
+        i = messageAt alice 3 (applying ours sample)
+        cancelled = ours ++ [FileStarted alice i (Sending 0), FileMoved alice (Sending 0) 5, FileEnded alice (Sending 0) False]
+        again = SendAgain alice i
+        file events = [ (attachmentState f, attachmentDone f) | m <- messagesOf alice (applying events sample), Just f <- [messageFile m] ]
+    commands cancelled again `shouldBe` [SendFile alice i "/sent/a.png" "a.png" 10 (Just "ours")]
+    file (cancelled ++ [again]) `shouldBe` [(Waiting, 0)]
+    commands (cancelled ++ [FriendOnline alice False]) again `shouldBe` []
+    commands (cancelled ++ [FriendOnline alice False, again]) (FriendOnline alice True)
+      `shouldContain` [SendFile alice i "/sent/a.png" "a.png" 10 (Just "ours")]
+    -- Only once, and never theirs.
+    commands (cancelled ++ [again]) again `shouldBe` []
+    let offered = ours ++ [FileOffered alice (Receiving 1) (at 3 9 1) "b.txt" 20 "/received/b.txt" "b"]
+        j = messageAt alice 4 (applying offered sample)
+    commands (offered ++ [Cancel alice j]) (SendAgain alice j) `shouldBe` []
 
   it "calls an online friend, talks once they answer, and hangs up" $ do
     let calling = [StartCall alice (at 3 9 0) False]
@@ -374,20 +491,36 @@ spec = do
   it "answers a message with its lines quoted" $ do
     let chat = FriendChat bob
         written = [SetDraft chat "two\nlines", Send chat (at 3 9 0)]
-        replied = written ++ [ReplyTo bob (messageAt bob 0 (applying written sample)), SetDraft chat "ok"]
-        sent = applying (replied ++ [Send chat (at 3 9 1)]) sample
-    commands (replied ++ [FriendOnline bob True]) (Send chat (at 3 9 1)) `shouldBe` [SendMessage bob (messageAt bob 1 sent) "> two\n> lines\nok" 0]
+        answered = written ++ [ReplyTo chat (messageAt bob 0 (applying written sample)), SetDraft chat "ok"]
+        sent = applying (answered ++ [Send chat (at 3 9 1)]) sample
+    commands (answered ++ [FriendOnline bob True]) (Send chat (at 3 9 1)) `shouldBe` [SendMessage bob (messageAt bob 1 sent) "> two\n> lines\nok" 0]
     map messageText (messagesOf bob sent) `shouldBe` ["two\nlines", "> two\n> lines\nok"]
     Map.lookup bob (clientReplies sent) `shouldBe` Nothing
 
+  it "answers what members said to everyone in a group, and forwards it" $ do
+    let chat = GroupChat team
+        said = inGroup ++ [ GroupReceived team (at 3 9 1) 1 Tox.MessageNormal "hello" Nothing
+                          , PrivateReceived team (at 3 9 2) 1 Tox.MessageNormal "psst", MemberLeft team (at 3 9 2) 1 Tox.ExitQuit ]
+        hello = entryAt team 0 (applying said sample)
+        psst = entryAt team 1 (applying said sample)
+        went = entryAt team 2 (applying said sample)
+        answered = said ++ [ReplyTo chat went, ReplyTo chat hello, SetDraft chat "hi"]
+        sent = applying (answered ++ [Send chat (at 3 9 3)]) sample
+    commands answered (Send chat (at 3 9 3)) `shouldBe` [SendGroupMessage team (entryAt team 3 sent) "> hello\nhi"]
+    Map.lookup team (clientGroupReplies sent) `shouldBe` Nothing
+    -- Nor what was said privately, as the answer may go to everyone.
+    mapM_ (\i -> replied (applying (said ++ [ReplyTo chat i]) sample) chat `shouldBe` Nothing) [went, psst]
+    map messageText (messagesOf bob (applying (said ++ [Forward chat [went, hello] bob (at 3 9 3)]) sample))
+      `shouldBe` ["hello"]
+
   it "forwards messages in order, sending them once the friend is online" $ do
     let chosen = [messageAt alice 2 sample, messageAt alice 0 sample]
-        forwarded n = messageAt alice n (applying [Forward alice chosen alice (at 3 9 0)] sample)
-    commands [] (Forward alice chosen alice (at 3 9 0))
+        forwarded n = messageAt alice n (applying [Forward (FriendChat alice) chosen alice (at 3 9 0)] sample)
+    commands [] (Forward (FriendChat alice) chosen alice (at 3 9 0))
       `shouldBe` [ SendMessage alice (forwarded 3) "Hi! Is this the Haskell client?" 0
                  , SendMessage alice (forwarded 4) "Looks good already." 0 ]
-    commands [] (Forward alice chosen bob (at 3 9 0)) `shouldBe` []
-    map messageText (messagesOf bob (applying [Forward alice chosen bob (at 3 9 0)] sample))
+    commands [] (Forward (FriendChat alice) chosen bob (at 3 9 0)) `shouldBe` []
+    map messageText (messagesOf bob (applying [Forward (FriendChat alice) chosen bob (at 3 9 0)] sample))
       `shouldBe` ["Hi! Is this the Haskell client?", "Looks good already."]
 
   it "accepts or rejects a friend request" $ do

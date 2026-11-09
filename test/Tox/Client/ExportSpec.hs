@@ -46,3 +46,8 @@ spec = do
     profileNickname (clientProfile client) `shouldBe` profileNickname (clientProfile sample)
     Map.toList (contactName <$> clientContacts client) `shouldBe` [(alice, Just "Alice"), (bob, Just "Bob")]
     importSave "toxEsave and the rest" `shouldBe` Left Encrypted
+
+  it "tells a profile saved with a password from one that isn't a profile" $ do
+    importSave "toxEsave and the rest" `shouldBe` Left Encrypted
+    unlockSave "password" "toxEsave too short" `shouldBe` Left NotAProfile
+    unlockSave "password" "toxEsave" `shouldBe` Left NotAProfile

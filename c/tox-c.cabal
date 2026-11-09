@@ -1,0 +1,51 @@
+cabal-version: 3.0
+name:          tox-c
+synopsis:      c-toxcore for the tox package
+version:       0.0.1
+stability:     experimental
+license:       GPL-3.0-only
+license-file:  LICENSE
+build-type:    Simple
+author:        iphy
+maintainer:    iphy
+copyright:     Copyright (c) 2026 The TokTok Team
+homepage:      https://toktok.ltd
+category:      Network
+description:
+  Lets clients of the tox package run on c-toxcore, through its Haskell
+  bindings.
+
+library
+  default-language: Haskell2010
+  hs-source-dirs:   src
+  ghc-options:      -Wall
+  exposed-modules:  Tox.Client.Toxcore.C
+  build-depends:
+      base            <5
+    , binary          <0.9
+    , bytestring      <0.13
+    , containers      <0.8
+    , saltine         >=0.2   && <0.3
+    , stm
+    , text            <2.2
+    , tox             >=0.0.1 && <0.0.2
+    , toxcore         >=0.2.12 && <0.3
+    , toxcore-c
+
+test-suite testsuite
+  default-language:   Haskell2010
+  type:               exitcode-stdio-1.0
+  hs-source-dirs:     test
+  ghc-options:        -Wall
+  main-is:            testsuite.hs
+  build-tool-depends: hspec-discover:hspec-discover
+  other-modules:      Tox.Client.Toxcore.CSpec
+  build-depends:
+      base            <5
+    , binary
+    , bytestring
+    , hspec
+    , QuickCheck
+    , tox
+    , tox-c
+    , toxcore

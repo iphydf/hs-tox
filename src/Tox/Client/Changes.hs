@@ -1,3 +1,4 @@
+{-# LANGUAGE StrictData #-}
 -- | What changed between two states of a client, for the app to store.
 module Tox.Client.Changes
   ( Change (..)
@@ -16,6 +17,8 @@ import qualified Tox.Sync.Replica  as Replica
 import qualified Tox.Sync.Store    as Sync
 
 import           Tox.Client
+import qualified Tox.Client.Home   as Home
+import           Tox.Client.Home   (Home)
 import qualified Tox.Client.Linked as Linked
 import           Tox.Client.Linked (Linked)
 import           Tox.Client.Types
@@ -34,13 +37,13 @@ data Change
     -- ^ PNG by its SHA-256.
   | AvatarDropped BS.ByteString
   | ContactChanged ContactId Bool Contact
-    -- ^ False if deleted with its chat kept. Its messages change apart.
+    -- ^ False if deleted with its chat kept. Its messages change separately.
   | ContactDeleted ContactId
     -- ^ With its chat.
   | MessageChanged ContactId Message
     -- ^ New ones in the order of their chat.
   | GroupChanged GroupId Group (Maybe Text)
-    -- ^ With its draft. Its entries change apart.
+    -- ^ With its draft. Its entries change separately.
   | GroupDeleted GroupId
   | EntryChanged GroupId GroupEntry
   | InviteChanged ContactId GroupId Invite
@@ -49,7 +52,8 @@ data Change
   | TextChanged Texts ContactId (Maybe Text)
   | PairingChanged (Maybe Text)
   | EventAdded Sync.EventId Word64 BS.ByteString
-    -- ^ A linked account's, with its rank. Its chats come from these.
+    -- ^ A linked account's, with its rank (its chats come from these), or
+    -- one the home wrote for its devices.
   deriving (Eq, Show)
 
 -- | For a linked account, its new events instead of its chats (they come
@@ -63,6 +67,7 @@ changes old new =
   ++ [AvatarAdded hash png | (hash, png) <- Map.toList (Map.difference (clientAvatars new) (clientAvatars old))]
   ++ [AvatarDropped hash | hash <- Map.keys (Map.difference (clientAvatars old) (clientAvatars new))]
   ++ maybe own (linked old) (clientLinked new)
+  ++ maybe [] (home old) (clientHome new)
   ++ [ StagedChanged cid (Map.findWithDefault [] cid (clientStaged new))
      | cid <- Set.toList (Map.keysSet (clientStaged old) <> Map.keysSet (clientStaged new))
      , Map.lookup cid (clientStaged old) /= Map.lookup cid (clientStaged new) ]
@@ -89,7 +94,9 @@ changes old new =
     groups =
       concat
         [ [GroupChanged gid g draft | fmap untold before /= Just (untold now)]
-          ++ [EntryChanged gid e | e <- since entryId kept (groupEntries g), Map.lookup (entryId e) kept /= Just e]
+          -- All new ones, as history from members goes in among older
+          -- entries. A page from the store is written again unchanged.
+          ++ [EntryChanged gid e | e <- groupEntries g, Map.lookup (entryId e) kept /= Just e]
         | gid <- Map.keys (clientGroups new)
         , Just now@(g, draft) <- [groupRow new gid]
         , let before = groupRow old gid
@@ -101,8 +108,8 @@ changes old new =
       [InviteChanged cid gid invite | ((cid, gid), invite) <- Map.toList (clientInvites new), Map.lookup (cid, gid) (clientInvites old) /= Just invite]
       ++ [InviteDeleted cid gid | (cid, gid) <- Map.keys (Map.difference (clientInvites old) (clientInvites new))]
 
--- | From the first we had on (those before it came from the store), or all
--- if we had none of them.
+-- | The items from the first one we already had (any before it came from the
+-- store), or all of them if we had none.
 since :: Ord k => (a -> k) -> Map.Map k a -> [a] -> [a]
 since key had now = case break ((`Map.member` had) . key) now of
   (_, [])   -> now
@@ -117,3 +124,10 @@ linked old l =
   where
     events = Replica.replicaStore . Linked.linkedReplica
     before = maybe Set.empty (Sync.storedIds . events) (clientLinked old)
+
+home :: Client -> Home -> [Change]
+home old h =
+  [ EventAdded i (Sync.eventRank e) bytes
+  | i <- Set.toList (Set.difference (Sync.storedIds (Home.homeStore h)) before)
+  , Just e <- [Sync.lookupEvent i (Home.homeStore h)], Just bytes <- [Sync.eventBytes i (Home.homeStore h)] ]
+  where before = maybe Set.empty (Sync.storedIds . Home.homeStore) (clientHome old)

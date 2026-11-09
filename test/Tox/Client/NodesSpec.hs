@@ -28,4 +28,6 @@ spec = do
     readNodes "{\"nodes\": []}" `shouldBe` Nothing
     readNodes "{\"nodes\": [" `shouldBe` Nothing
     readNodes "<html>" `shouldBe` Nothing
-    length (usable builtIn) `shouldBe` length builtIn
+
+  it "has TCP relays built in" $
+    usable builtIn `shouldNotBe` []

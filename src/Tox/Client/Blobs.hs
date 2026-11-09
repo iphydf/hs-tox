@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StrictData          #-}
 -- | Account sync blobs to and from a linked account's home: files of their
 -- own kind whose ID is the SHA-256. Stored on disk by ID in hex. We only
 -- take ones we asked for, and only if the hash matches.
@@ -43,7 +44,7 @@ import           System.IO               (Handle, IOMode (..), SeekMode (..),
                                           hClose, hSeek, openBinaryFile,
                                           withBinaryFile)
 import           System.Posix.Files      (createLink)
-import qualified Tox.Application.Tox     as Tox
+import qualified Tox.Client.Toxcore      as Tox
 import           Tox.Crypto.Core.Key     (PublicKey)
 
 import qualified Tox.Client.Avatars      as Avatars

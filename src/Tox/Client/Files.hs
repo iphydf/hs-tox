@@ -1,6 +1,7 @@
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StrictData          #-}
 -- | File transfers with friends. Reports progress in steps.
 module Tox.Client.Files
   ( Report (..)
@@ -39,7 +40,7 @@ import           System.FilePath         (splitExtension, (</>))
 import           System.IO               (Handle, IOMode (..), SeekMode (..),
                                           hClose, hFileSize, hSeek,
                                           hSetFileSize, openBinaryFile)
-import qualified Tox.Application.Tox     as Tox
+import qualified Tox.Client.Toxcore      as Tox
 import           Tox.Crypto.Core.Key     (PublicKey)
 
 import           Tox.Client.Types

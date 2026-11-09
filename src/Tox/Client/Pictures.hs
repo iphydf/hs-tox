@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData        #-}
 -- | Picture formats to send in, other than as they are. The user picks one
 -- per chat, and gallery and camera pictures get converted.
 module Tox.Client.Pictures

@@ -1,0 +1,51 @@
+load("@rules_haskell//haskell:defs.bzl", "haskell_library")
+load("//third_party/haskell/hspec-discover:build_defs.bzl", "hspec_test")
+
+haskell_library(
+    name = "c",
+    srcs = glob(["src/**/*.hs"]),
+    # hs-toxcore-c builds static only.
+    linkstatic = True,
+    src_strip_prefix = "src",
+    tags = [
+        "haskell",
+        "no-cross",
+    ],
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//hs-tox",
+        "//hs-toxcore:tox-application",
+        "//hs-toxcore:tox-core",
+        "//hs-toxcore:tox-crypto",
+        "//hs-toxcore:tox-network",
+        "//hs-toxcore:tox-persistence",
+        "//hs-toxcore-c",
+        "//third_party/haskell:base",
+        "//third_party/haskell:binary",
+        "//third_party/haskell:bytestring",
+        "//third_party/haskell:containers",
+        "//third_party/haskell:saltine",
+        "//third_party/haskell:stm",
+        "//third_party/haskell:text",
+    ],
+)
+
+hspec_test(
+    name = "testsuite",
+    size = "small",
+    ghcopts = ["-Wno-missed-extra-shared-lib"],
+    linkstatic = True,
+    deps = [
+        ":c",
+        "//hs-tox",
+        "//hs-toxcore:tox-application",
+        "//hs-toxcore:tox-crypto",
+        "//hs-toxcore:tox-persistence",
+        "//third_party/haskell:QuickCheck",
+        "//third_party/haskell:base",
+        "//third_party/haskell:binary",
+        "//third_party/haskell:bytestring",
+        "//third_party/haskell:hspec",
+    ],
+)

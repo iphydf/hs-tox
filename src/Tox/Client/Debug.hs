@@ -6,6 +6,9 @@
 -- | Where time and memory go, for the debug screen and the log.
 module Tox.Client.Debug
   ( Report (..)
+  , Call (..)
+  , callText
+  , videoText
   , Runtime (..)
   , Threads
   , runtime
@@ -43,7 +46,36 @@ import           System.Mem            (performMajorGC)
 import           Text.Read             (readMaybe)
 
 import qualified Tox.Application.Tox   as Tox
+import qualified Tox.AV                as AV
+import qualified Tox.AV.Playout        as Playout
 import           Tox.Core.Lanes        (Lane (..))
+
+-- | How a call's audio played and its video came, so far.
+data Call = Call
+  { callWith  :: Text -- ^ The start of the friend's key.
+  , callAudio :: Playout.Stats
+  , callVideo :: Maybe AV.VideoStats
+  , callSends :: Maybe Text -- ^ The encoder we send our video with.
+  } deriving (Eq, Show)
+
+callText :: Call -> Text
+callText (Call with (Playout.Stats up down made skips) video sends) =
+  "call with " <> with <> ": audio " <> n up <> " sped up, " <> n down <> " slowed down, "
+  <> n made <> " blocks made up, " <> n skips <> " jumps ahead"
+  <> maybe "" (("; " <>) . videoText) video
+  <> maybe "" ("; sending video with " <>) sends
+  where n = Text.pack . show
+
+-- | A smear is from a lost video frame to the next key frame, which we ask
+-- the friend for.
+videoText :: AV.VideoStats -> Text
+videoText v =
+  "video " <> n (AV.framesCame v) <> " frames, " <> n (AV.framesLost v) <> " lost ("
+  <> n (AV.framesIncomplete v) <> " incomplete), " <> n (AV.keyFramesCame v) <> " key frames, "
+  <> n (AV.smears v) <> " smears over " <> n (AV.smearedFrames v) <> " frames ("
+  <> n (AV.smearedMs v) <> " ms), " <> n (AV.picturesDecoded v) <> " pictures, "
+  <> n (AV.decodeFailures v) <> " failed"
+  where n = Text.pack . show
 
 -- | From the GHC runtime, which keeps them only when started with @-T@.
 data Runtime = Runtime
@@ -72,6 +104,7 @@ data Report = Report
   , reportTox     :: Map Text Lane -- ^ Tox's main loop.
   , reportSizes   :: [Tox.Size]
   , reportTraffic :: [(Tox.Counted, Tox.Count)] -- ^ Since Tox started.
+  , reportCalls   :: [Call]
   } deriving (Eq, Show)
 
 runtime :: IO (Maybe Runtime)
@@ -116,6 +149,7 @@ summary before r = Text.intercalate "; " $
   ++ [ "big " <> Text.intercalate ", " [ Tox.sizeName s <> " " <> Text.pack (show (Tox.sizeCount s)) | s <- big ] | not (null big) ]
   ++ trafficSummary (maybe "since Tox started" (const "since the last") before)
        (sinceThen (maybe [] reportTraffic before) (reportTraffic r))
+  ++ map callText (reportCalls r)
   where
     busiest = take 5 . sortOn (Down . laneTotal . snd) $ Map.toList (reportApp r) ++ Map.toList (reportTox r)
     lane (name, l) = name <> " " <> ms (laneTotal l) <> " in " <> Text.pack (show (laneCount l)) <> " (worst " <> ms (laneWorst l) <> ")"
@@ -157,8 +191,19 @@ toxRows profile r =
   ++ concat
     [ [ (key "packets", fromIntegral (Tox.countTimes c)), (key "bytes", fromIntegral (Tox.countBytes c)) ]
     | (what, c) <- reportTraffic r, let key k = profile <> " traffic " <> Tox.countedName what <> " " <> k ]
+  ++ concatMap callRows (reportCalls r)
+  where
+    callRows (Call with (Playout.Stats up down made skips) video _) =
+      [ (key ("audio " <> k), v) | (k, v) <- [("sped up", up), ("slowed down", down), ("made up", made), ("jumps ahead", skips)] ]
+      ++ concat
+        [ [ (key ("video " <> k), f v) | (k, f) <- videoFields ] | Just v <- [video] ]
+      where key k = profile <> " call " <> with <> " " <> k
+    videoFields =
+      [ ("frames", AV.framesCame), ("lost", AV.framesLost), ("incomplete", AV.framesIncomplete)
+      , ("key frames", AV.keyFramesCame), ("smears", AV.smears), ("smeared frames", AV.smearedFrames)
+      , ("smeared ms", AV.smearedMs), ("pictures", AV.picturesDecoded), ("failed", AV.decodeFailures) ]
 
--- | What was counted after the first totals and by the second.
+-- | Counts from the first totals to the second.
 sinceThen :: [(Tox.Counted, Tox.Count)] -> [(Tox.Counted, Tox.Count)] -> [(Tox.Counted, Tox.Count)]
 sinceThen old new =
   [ (what, Tox.Count (Tox.countTimes c - Tox.countTimes o) (Tox.countBytes c - Tox.countBytes o))

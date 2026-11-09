@@ -5,6 +5,7 @@ import qualified Crypto.Hash.SHA256  as SHA256
 import qualified Data.ByteString     as BS
 import qualified Data.Map.Strict     as Map
 import qualified Data.Text           as Text
+import qualified Data.Text.Encoding  as Text
 import           Data.Time           (UTCTime)
 import           Test.Hspec
 import qualified Tox.Application.Tox as Tox
@@ -13,6 +14,7 @@ import qualified Tox.Sync.Fact       as Sync
 import qualified Tox.Sync.Frame      as Frame
 import qualified Tox.Sync.Id         as Sync
 import qualified Tox.Sync.Protocol   as Sync
+import qualified Tox.Sync.Session    as Session
 import qualified Tox.Sync.Setting    as Sync
 import qualified Tox.Sync.Store      as Sync
 
@@ -49,21 +51,28 @@ bobChat = Sync.friendGraph homeKey bobKey
 
 -- | Bob as a friend with a name, and his message.
 homeEvents :: [BS.ByteString]
-homeEvents = snd (foldl write (Sync.emptyStore, []) contents)
+homeEvents = writtenByHome
+  [ (account, at 5 10 0, Sync.WantFriend bobKey Nothing Nothing)
+  , (account, at 5 10 0, Sync.FactContent (Sync.FriendSubject bobKey) (Sync.Name "Bob"))
+  , (bobChat, at 5 10 1, Sync.Received Nothing "Bob" "hi" Sync.Normal)
+  -- Another device of the account (the home has it as a friend).
+  , (account, at 5 10 2, Sync.WantFriend tabletKey Nothing Nothing)
+  , (account, at 5 10 2, Sync.Device tabletKey "Tablet") ]
+
+-- | Each event as the home writes it, in its graph at its time.
+writtenByHome :: [(Sync.GraphId, UTCTime, Sync.Content)] -> [BS.ByteString]
+writtenByHome = snd . foldl write (Sync.emptyStore, [])
   where
-    contents =
-      [ (account, at 5 10 0, Sync.WantFriend bobKey Nothing Nothing)
-      , (account, at 5 10 0, Sync.FactContent (Sync.FriendSubject bobKey) (Sync.Name "Bob"))
-      , (bobChat, at 5 10 1, Sync.Received Nothing "Bob" "hi" Sync.Normal)
-      -- Another device of the account (the home has it as a friend).
-      , (account, at 5 10 2, Sync.WantFriend tabletKey Nothing Nothing)
-      , (account, at 5 10 2, Sync.Device tabletKey "Tablet") ]
     write (store, written) (g, time, content) =
       let (_, bytes, store') = Sync.create g homeKey (Linked.toMillis time) content store
       in (store', written ++ [bytes])
 
+-- | Each event as the home writes it at @time@.
+writtenAt :: UTCTime -> [(Sync.GraphId, Sync.Content)] -> [BS.ByteString]
+writtenAt time = writtenByHome . map (\(g, content) -> (g, time, content))
+
 fromHome :: Sync.SessionMessage -> [Event]
-fromHome = map (SyncReceived home) . Frame.frames . Sync.encodeMessage
+fromHome = map (SyncReceived home (at 3 9 0)) . Frame.frames . Sync.encodeMessage
 
 run :: Viewing -> [Event] -> Client -> (Client, [Command])
 run viewing events client = foldl (\(c, cs) e -> let (c', cs') = update viewing e c in (c', cs ++ cs')) (client, []) events
@@ -127,10 +136,7 @@ spec = do
 
   it "shows private messages in groups, and asks the home to send ours" $ do
     let lab = Sync.GroupChat (BS.replicate 32 0x33)
-        write (store, written) (g, content) =
-          let (_, bytes, store') = Sync.create g homeKey (Linked.toMillis (at 5 10 3)) content store
-          in (store', written ++ [bytes])
-        events = snd $ foldl write (Sync.emptyStore, [])
+        events = writtenAt (at 5 10 3)
           [ (account, Sync.FactContent (Sync.ChatSubject lab) (Sync.Joined True))
           , (account, Sync.FactContent (Sync.ChatSubject lab) (Sync.Name "Lab"))
           , (Sync.chatGraph lab, Sync.ReceivedPrivately bobKey "Bob" "psst" Sync.Normal) ]
@@ -150,14 +156,24 @@ spec = do
     [c | c@Sync.SendPrivately {} <- sent (snd (run (looking chat) privately client))]
       `shouldBe` [Sync.SendPrivately bobKey "" "hi Bob" Sync.Normal]
 
+  it "shows who came, went and got a role in groups" $ do
+    let lab = Sync.GroupChat (BS.replicate 32 0x33)
+        events = writtenAt (at 5 10 3)
+          [ (account, Sync.FactContent (Sync.ChatSubject lab) (Sync.Joined True))
+          , (Sync.chatGraph lab, Sync.PeerJoined bobKey "Bob")
+          , (Sync.chatGraph lab, Sync.Moderated Nothing "" (Just bobKey) "Bob" (Just Sync.Moderator))
+          , (Sync.chatGraph lab, Sync.PeerLeft bobKey "Bob") ]
+        client = fst (run unseen (fromHome (Sync.Events events)) synced)
+        member = Member (Text.replicate 32 "11") "Bob"
+    map entryWhat . groupEntries <$> Map.lookup (GroupId (Text.replicate 32 "33")) (clientGroups client)
+      `shouldBe` Just [Arrived member, Moderated (Just (Member "" "")) (Just member) Tox.ModModerator, Departed member]
+
   it "asks the home to moderate and change a group's settings" $ do
     let lab = Sync.GroupChat (BS.replicate 32 0x33)
-        write (store, written) content =
-          let (_, bytes, store') = Sync.create account homeKey (Linked.toMillis (at 5 10 3)) (Sync.FactContent (Sync.ChatSubject lab) content) store
-          in (store', written ++ [bytes])
-        events = snd $ foldl write (Sync.emptyStore, [])
-          [ Sync.Joined True, Sync.Name "Lab", Sync.PrivacyValue Sync.Public, Sync.PeerLimit 100
-          , Sync.VoiceStateValue Sync.VoiceEveryone, Sync.RoleValue Sync.Founder ]
+        events = writtenAt (at 5 10 3)
+          [ (account, Sync.FactContent (Sync.ChatSubject lab) v)
+          | v <- [ Sync.Joined True, Sync.Name "Lab", Sync.PrivacyValue Sync.Public, Sync.PeerLimit 100
+                 , Sync.VoiceStateValue Sync.VoiceEveryone, Sync.RoleValue Sync.Founder ] ]
         present = Sync.Facts [(Sync.PeerSubject lab bobKey, Sync.Present True)] True
         client = fst (run unseen (fromHome (Sync.Events events) ++ fromHome present) synced)
         gid = GroupId (Text.replicate 32 "33")
@@ -168,6 +184,17 @@ spec = do
     private `shouldBe` [(Sync.ChatSubject lab, Sync.PrivacyValue Sync.Private)]
     -- We only show chats the account is in, so deleting one leaves it.
     wishes (DeleteGroup gid) `shouldBe` [(Sync.ChatSubject lab, Sync.Joined False)]
+
+  it "offers the topic to whom Tox takes it from: not observers, and only moderators while locked" $ do
+    let lab = Sync.GroupChat (BS.replicate 32 0x33)
+        gid = GroupId (Text.replicate 32 "33")
+        may role locked =
+          let events = writtenAt (at 5 10 3)
+                [ (account, Sync.FactContent (Sync.ChatSubject lab) v)
+                | v <- [Sync.Joined True, Sync.Name "Lab", Sync.TopicLock locked, Sync.RoleValue role] ]
+          in groupMayTopic <$> Map.lookup gid (clientGroups (fst (run unseen (fromHome (Sync.Events events)) synced)))
+    map (uncurry may) [(Sync.User, False), (Sync.Observer, False), (Sync.User, True), (Sync.Moderator, True)]
+      `shouldBe` map Just [True, False, False, True]
 
   it "fetches avatars from the home, serves it ours, and asks it to show ours" $ do
     let png = "a picture"
@@ -221,6 +248,25 @@ spec = do
         client = fst (run unseen (fromHome (Sync.Events [b1, b2, b3, b4])) synced)
     contactUnread <$> Map.lookup bob (clientContacts client) `shouldBe` Just 2
 
+  it "pages back through a chat from the home, as far as it goes" $ do
+    let said = writtenByHome $ (account, at 5 10 0, Sync.WantFriend bobKey Nothing Nothing)
+          : [(bobChat, at 5 10 0, Sync.Received Nothing "Bob" (Text.encodeUtf8 n) Sync.Normal) | n <- numbers]
+        numbers = map (Text.pack . show) [1 .. 120 :: Int]
+        homeStore = foldl (\store bytes -> either (const store) snd (Sync.insert bytes store)) Sync.emptyStore said
+        -- The account and the latest page, as a new session brings them.
+        latest = fst (run unseen (fromHome Sync.hello ++ fromHome (Sync.Events (take 1 said ++ drop 71 said))) linked)
+        scroll client =
+          let (client', commands) = step (WantEarlier (FriendChat bob)) client
+              asked = toHome commands
+          in (asked, fst (run unseen (concatMap fromHome (concatMap (Session.answer homeStore) asked)) client'))
+        (asked1, page1) = scroll latest
+        (_, page2) = scroll page1
+        (asked3, _) = scroll page2
+        shown c = maybe ([], False) (\c' -> (map messageText (contactMessages c'), contactEarlier c')) (Map.lookup bob (clientContacts c))
+    [g | Sync.History g _ _ <- asked1] `shouldBe` [bobChat]
+    map shown [latest, page1, page2] `shouldBe` [(drop 70 numbers, True), (drop 20 numbers, True), (numbers, False)]
+    asked3 `shouldBe` []
+
   it "asks the home to show the account away" $
     [v | Sync.Wish Sync.AccountSubject v <- sent (snd (step (SetAway Tox.Away) synced))]
       `shouldBe` [Sync.Status Sync.Away]
@@ -232,6 +278,16 @@ spec = do
     contactPictures <$> Map.lookup bob (clientContacts client) `shouldBe` Just (Just "qoi")
     [c | c@Sync.ClearSetting {} <- sent (snd (step (SendPictures bob Nothing) client))]
       `shouldBe` [Sync.ClearSetting (Sync.ConversationScope bobChat) 1]
+
+  it "keeps the way pictures go to a group with the account" $ do
+    let lab = Sync.GroupChat (BS.replicate 32 0x33)
+        events = writtenAt (at 5 10 3) [(account, Sync.FactContent (Sync.ChatSubject lab) v) | v <- [Sync.Joined True, Sync.Name "Lab"]]
+        client = fst (run unseen (fromHome (Sync.Events events)) synced)
+        gid = GroupId (Text.replicate 32 "33")
+        (sending, commands) = step (SendGroupPictures gid (Just "qoi")) client
+    [c | c@Sync.SettingContent {} <- sent commands]
+      `shouldBe` [Sync.SettingContent (Sync.ConversationScope (Sync.chatGraph lab)) (Sync.kept (Sync.PictureFormat Sync.Qoi))]
+    groupPictures <$> Map.lookup gid (clientGroups sending) `shouldBe` Just (Just "qoi")
 
   it "keeps our files as blobs and asks the home to send them" $ do
     let chat = FriendChat bob
